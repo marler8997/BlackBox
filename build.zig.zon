@@ -1,0 +1,29 @@
+.{
+    .name = .BlackBox,
+    .fingerprint = 0x7c344ac06e0a04c8,
+    .minimum_zig_version = "0.17.1",
+    .version = "0.0.1",
+    .dependencies = .{
+        .win32 = .{
+            .url = "git+https://github.com/marlersoft/zigwin32#fb2645891520f3e99931db17a7eba04057e87e89",
+            .hash = "win32-42.0.39-preview-mX5pFc794wMcrMyFgsO1c4csBdowhpiqqwIyN_xjqI5z",
+        },
+        .wintrace = .{
+            .url = "git+https://github.com/marler8997/wintrace#cc3abae1a2bf983d18ef12e7dc3c25841f4af561",
+            .hash = "wintrace-0.0.0-RwkrxRZ2AgCW4RIfUAeI75IB8shdP6warZnLxfxvEC0X",
+        },
+        .patch = .{
+            .url = "git+https://github.com/marler8997/zig-patch#07e0704e8337e0525cbb9c02cc6ff94682129a64",
+            .hash = "patch-0.0.0-WCKjs9q1AADtBsFLsb_cWBxRMFbHol2iMsLyn0zizpJb",
+        },
+        .staticio = .{
+            .url = "git+https://github.com/marler8997/zig-staticio#1ef1b4374703b72beb44e494cc9d03d7944567e3",
+            .hash = "staticio-0.0.0-ypcguAK1AADvFgpnMy2lYwxPrSFYq-Z4rw11Spk142R7",
+        },
+        .appicon = .{
+            .url = "git+https://github.com/marler8997/appicon#200b5ebf5af839f8f25defb84d66c237a390120c",
+            .hash = "appicon-0.0.1-Q2lBVpfeAAC0ZGXXo3XsXXV1sPnBVstU11_XZut5523K",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

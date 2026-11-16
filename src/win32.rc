@@ -1,0 +1,5 @@
+// LANG_NEUTRAL(0), SUBLANG_NEUTRAL(0)
+LANGUAGE 0, 0
+
+// The app's icon (Explorer, the taskbar, the window): built by build.zig from src/icon.
+1 ICON "blackbox.ico"
