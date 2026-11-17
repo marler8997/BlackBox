@@ -1,0 +1,21 @@
+name: Test
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [windows-latest, windows-11-arm]
+      fail-fast: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: marler8997/setup-anyzig@master
+      # The tests need no audio devices: drift correction is computation, recovery works in
+      # %TEMP%, and the command line tests run blackbox.exe.
+      - run: zig build install test --summary all
+      # What a release builds, so a release can't be the first to find it broken.
+      - run: zig build install -Doptimize=ReleaseSafe --summary all
