@@ -1,0 +1,129 @@
+name: Release
+# Run by hand from the Actions tab, on master: builds master's head into a draft release, to
+# download and try before deciding (the run's summary says how). Publishing it is by hand too:
+# "Publish release" on the draft, or `gh release edit TAG --draft=false --latest`. Running again
+# on the same commit replaces its draft, and does nothing once that commit is published.
+#
+# On a pull request it's a dry run: the same build, with the zips uploaded to the run.
+#
+# Not tested here: test.yml tests every push to master, natively on x86_64 and ARM64.
+on: [pull_request, workflow_dispatch]
+# Read only, for the build: it runs build.zig and setup-anyzig, so on a pull request it runs
+# the pull request's code. Only the publish job, on master, can write.
+permissions:
+  contents: read
+env:
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+  PUBLISH: ${{ github.event_name == 'workflow_dispatch' }}
+jobs:
+  build:
+    # Linux, though the exes are for Windows: Zig cross builds them, and building on Linux is
+    # faster than on Windows (146 s against 245 s when we measured both).
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: pwsh
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      released: ${{ steps.tag.outputs.released }}
+    steps:
+      # On a pull request its own head, not the merge commit GitHub makes by default: what
+      # master gets when it's merged, named for that commit.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: marler8997/setup-anyzig@master
+      # Named for when the commit was made and which it is, e.g. 2026_11_17_10_42-8b271f7, so
+      # releases sort by date and each names its commit.
+      - name: tag
+        id: tag
+        run: |
+          if ($env:PUBLISH -eq 'true' -and $env:GITHUB_REF -ne 'refs/heads/master') {
+            throw "releases come from master, this is $env:GITHUB_REF"
+          }
+          $committed = git show -s --format=%ct HEAD
+          if ($LASTEXITCODE -ne 0) { throw "git show failed with exit code $LASTEXITCODE" }
+          $short = git rev-parse --short HEAD
+          if ($LASTEXITCODE -ne 0) { throw "git rev-parse failed with exit code $LASTEXITCODE" }
+          $tag = "{0:yyyy_MM_dd_HH_mm}-{1}" -f [DateTimeOffset]::FromUnixTimeSeconds([long]$committed).UtcDateTime, $short
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          if ($env:PUBLISH -eq 'true') {
+            # A draft of it doesn't count: running again replaces the draft.
+            $view = gh release view $tag --json isDraft --jq .isDraft 2>&1
+            if ($LASTEXITCODE -eq 0) {
+              if ("$view" -eq 'false') {
+                "::notice::$tag is already released"
+                "released=true" >> $env:GITHUB_OUTPUT
+              }
+            } elseif ("$view" -notmatch 'release not found') {
+              throw "gh release view $tag failed with exit code ${LASTEXITCODE}: $view"
+            }
+          }
+          $global:LASTEXITCODE = 0
+      # A zip per architecture, each the installed layout: BlackBox.exe and bin\blackbox.exe.
+      # With their .pdb files, so a crash's error trace names functions and lines. (build.zig
+      # cross builds each for its architecture's baseline CPU, never the runner's.)
+      - if: steps.tag.outputs.released != 'true'
+        name: build
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          zig build install-x86_64 install-aarch64 -Doptimize=ReleaseSafe --prefix release --summary all
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($arch in 'x86_64', 'aarch64') {
+            Compress-Archive -Path "release/$arch/appdata/*" -DestinationPath "BlackBox-$env:TAG-$arch.zip"
+          }
+      - if: steps.tag.outputs.released != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: BlackBox-${{ steps.tag.outputs.tag }}
+          path: BlackBox-${{ steps.tag.outputs.tag }}-*.zip
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && needs.build.outputs.released != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: BlackBox-${{ needs.build.outputs.tag }}
+      # A draft has no tag yet (it's made when the draft is published), so deleting one leaves
+      # nothing behind.
+      - env:
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          $view = gh release view $env:TAG --json isDraft --jq .isDraft 2>&1
+          if ($LASTEXITCODE -eq 0) {
+            if ("$view" -ne 'true') { throw "$env:TAG was published while this run built it" }
+            "replacing the draft of $env:TAG"
+            gh release delete $env:TAG --yes
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } elseif ("$view" -notmatch 'release not found') {
+            throw "gh release view $env:TAG failed with exit code ${LASTEXITCODE}: $view"
+          }
+          $url = gh release create $env:TAG "BlackBox-$env:TAG-x86_64.zip" "BlackBox-$env:TAG-aarch64.zip" --draft --target $env:GITHUB_SHA --title $env:TAG --notes "Built from $env:GITHUB_SHA."
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          @"
+          ## Draft release $env:TAG
+
+          $url
+
+          Try it:
+
+              gh release download $env:TAG -R $env:GH_REPO -D BlackBox-$env:TAG
+
+          Then publish it:
+
+              gh release edit $env:TAG -R $env:GH_REPO --draft=false --latest
+
+          or throw it away:
+
+              gh release delete $env:TAG -R $env:GH_REPO --yes
+          "@ >> $env:GITHUB_STEP_SUMMARY

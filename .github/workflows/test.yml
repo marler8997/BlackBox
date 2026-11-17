@@ -17,5 +17,3 @@ jobs:
       # The tests need no audio devices: drift correction is computation, recovery works in
       # %TEMP%, and the command line tests run blackbox.exe.
       - run: zig build install test --summary all
-      # What a release builds, so a release can't be the first to find it broken.
-      - run: zig build install -Doptimize=ReleaseSafe --summary all
