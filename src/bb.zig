@@ -109,9 +109,9 @@ pub const SourceKind = enum {
     /// Whether adding one first asks which device.
     fn hasDevice(k: SourceKind) bool {
         return switch (k) {
-            .microphone, .system_audio => true,
-            // TODO: pick which screen/window/webcam.
-            .screen, .webcam => false,
+            .microphone, .system_audio, .webcam => true,
+            // TODO: pick which screen/window.
+            .screen => false,
         };
     }
 
@@ -156,8 +156,7 @@ pub const SourceKind = enum {
     fn todo(k: SourceKind) ?[]const u8 {
         return switch (k) {
             .screen => "TODO: implement screen recording",
-            .webcam => "TODO: implement webcam recording",
-            .system_audio, .microphone => null,
+            .webcam, .system_audio, .microphone => null,
         };
     }
 };
@@ -289,7 +288,17 @@ const TrackRow = enum {
     name,
     device_format,
     captured_as,
+    /// Video: what the camera sends.
+    camera_format,
     effects,
+    /// Video: what encodes it, and where.
+    encoder,
+    /// Video: the GPU encoding it.
+    gpu,
+    /// Video: the encoder's target bitrate.
+    bitrate,
+    /// Video: frames encoded and dropped.
+    frames,
     /// Debug: the recording ring's size.
     buffer,
     clips,
@@ -303,9 +312,12 @@ fn trackRows(src: *const Source, buf: *[std.enums.values(TrackRow).len]TrackRow)
         // By kind only, never by state: the same track always has the same rows, those that
         // don't apply right now are disabled.
         const applies = switch (row) {
-            .name, .remove => true,
-            .device_format => src.kind.hasDevice(),
-            .captured_as, .effects, .buffer, .clips => !src.kind.isVideo(),
+            .name, .remove, .captured_as, .buffer => true,
+            // A webcam's device has no audio format.
+            .device_format => src.kind.hasDevice() and !src.kind.isVideo(),
+            .effects, .clips => !src.kind.isVideo(),
+            .encoder, .gpu, .bitrate, .frames => src.kind.isVideo(),
+            .camera_format => src.kind == .webcam,
         };
         if (!applies) continue;
         buf[n] = row;
@@ -337,6 +349,8 @@ pub const Source = struct {
     status: SourceStatus = .starting,
     /// Owned by the platform's capture, see setSourceMeter.
     meter: ?*const Meter = null,
+    /// A webcam's frames so far, owned by its capture, see setSourceVideoCounts.
+    video_counts: ?*const VideoCounts = null,
     /// The meter's clip count when the user last cleared the clip warning.
     clips_cleared: u32 = 0,
     /// Why recording this source failed, see setSourceRecordError.
@@ -362,6 +376,12 @@ pub const Source = struct {
 
     /// Times it clipped since the user last cleared the warning. Sticky, so a clip isn't
     /// missed when it scrolls out of view, or happens while nobody's looking.
+    /// A webcam's frames so far, none for other sources.
+    fn frameCounts(s: *const Source) FrameCounts {
+        const vc = s.video_counts orelse return .{};
+        return .{ .encoded = vc.encoded.load(.monotonic), .dropped = vc.dropped.load(.monotonic) };
+    }
+
     fn clips(s: *const Source) u32 {
         const meter = s.meter orelse return 0;
         return meter.clips.load(.monotonic) - s.clips_cleared;
@@ -374,13 +394,86 @@ pub const SourceStatus = union(enum) {
     live: Live,
     failed: Message,
 
-    pub const Live = struct {
+    pub const Live = union(enum) {
+        audio: AudioLive,
+        video: VideoLive,
+    };
+
+    pub const AudioLive = struct {
         /// What we receive, which may differ from the device's (Device.format): Windows'
         /// shared mode converts.
         format: AudioFormat,
         /// Whether Windows' audio effects are bypassed. Not when the device doesn't allow it.
         raw: bool,
     };
+
+    pub const VideoLive = struct {
+        format: VideoFormat,
+        /// The encoder's target, bits per second.
+        bitrate: u32,
+        path: EncodePath,
+        encoder_buf: [64]u8 = undefined,
+        encoder_len: u8 = 0,
+        /// The GPU the encoder runs on (its adapter's name); none for software.
+        gpu_buf: [64]u8 = undefined,
+        gpu_len: u8 = 0,
+        /// What the camera sends (e.g. "MJPG"), and whether it's converted for the encoder.
+        camera_format_buf: [36]u8 = undefined,
+        camera_format_len: u8 = 0,
+        camera_converted: bool = false,
+
+        pub fn encoder(v: *const VideoLive) []const u8 {
+            return v.encoder_buf[0..v.encoder_len];
+        }
+        pub fn gpu(v: *const VideoLive) []const u8 {
+            return v.gpu_buf[0..v.gpu_len];
+        }
+        pub fn cameraFormat(v: *const VideoLive) []const u8 {
+            return v.camera_format_buf[0..v.camera_format_len];
+        }
+    };
+
+    /// Where a video's frames are encoded.
+    pub const EncodePath = enum {
+        /// By the GPU, the frames never leaving it.
+        gpu,
+        /// By the GPU's encoder, from frames in system memory (it doesn't take textures).
+        hardware,
+        /// By the CPU.
+        software,
+
+        fn note(e: EncodePath) []const u8 {
+            return switch (e) {
+                .gpu => "GPU",
+                .hardware => "Hardware",
+                .software => "Software",
+            };
+        }
+    };
+};
+
+/// A video stream's format: its size and frames per second (a fraction).
+pub const VideoFormat = struct {
+    width: u32,
+    height: u32,
+    fps_num: u32,
+    fps_den: u32,
+
+    /// E.g. "Captured as 1920x1080 at 30 fps", the rate rounded.
+    const CapturedAsText = maxstring.MaxString(.utf8, .no_sentinel, &.{
+        .{ .static = "Captured as " },
+        .{ .runtime_value = .{ .name = "width", .type = u32 } },
+        .{ .static = "x" },
+        .{ .runtime_value = .{ .name = "height", .type = u32 } },
+        .{ .static = " at " },
+        .{ .runtime_value = .{ .name = "fps", .type = u32 } },
+        .{ .static = " fps" },
+    });
+
+    fn capturedAsText(f: VideoFormat) CapturedAsText.Formatted {
+        const fps = if (f.fps_den == 0) 0 else (f.fps_num + f.fps_den / 2) / f.fps_den;
+        return CapturedAsText.format(.{ .width = f.width, .height = f.height, .fps = fps });
+    }
 };
 
 /// Text for the user, in a fixed buffer so statuses can be copied around.
@@ -478,10 +571,20 @@ pub const CaptureExclusion = union(enum) {
     failed: u32,
 };
 
+/// What Black Box is doing with recordings.
+const Mode = enum {
+    idle,
+    /// The user wants to be recording: the platform records to match (see isRecording).
+    recording,
+    /// Quit was asked for while recording or while a recording's files were still being
+    /// finished: it closes once they are (see closeWhenFinished).
+    closing,
+};
+
 const State = struct {
     settings: Settings = .{},
     capture_exclusion: CaptureExclusion = .ok,
-    recording: bool = false,
+    mode: Mode = .idle,
     recording_error: ?Message = null,
     recording_elapsed_ms: ?u64 = null,
     disk: Disk = .{},
@@ -519,6 +622,8 @@ const State = struct {
     menu_row_h: i32 = 1,
     /// The track's uncleared clips when its menu opened.
     track_menu_clips: u32 = 0,
+    /// A webcam track's frames as its open menu last painted them: see menuChanged.
+    track_menu_frames: FrameCounts = .{},
     /// The widest row note's text, from menuRect: notes are drawn as tags this wide.
     menu_note_w: i32 = 0,
     /// Live levels for the open devices menu's rows, one per device, from the platform (see
@@ -624,7 +729,9 @@ pub fn onMouseUp(x: i32, y: i32) bool {
         .minimize_button => state.minimize_requested = true,
         .track => |id| {
             state.menu = .{ .track = id };
-            state.track_menu_clips = findSource(id).?.clips();
+            const src = findSource(id).?;
+            state.track_menu_clips = src.clips();
+            state.track_menu_frames = src.frameCounts();
         },
     }
     return true;
@@ -679,6 +786,21 @@ pub fn setSourceMeter(id: u32, meter: ?*const Meter) void {
     if (findSource(id)) |s| s.meter = meter;
 }
 
+const FrameCounts = struct { encoded: u64 = 0, dropped: u64 = 0 };
+
+/// A webcam's frames since its capture started, counted by its capture thread.
+pub const VideoCounts = struct {
+    encoded: std.atomic.Value(u64) = .init(0),
+    /// Refused by the encoder (it was busy): not in the recording.
+    dropped: std.atomic.Value(u64) = .init(0),
+};
+
+/// The platform's capture for this webcam counts its frames here, for as long as the source
+/// exists. Ignored if the source is gone.
+pub fn setSourceVideoCounts(id: u32, counts: *const VideoCounts) void {
+    if (findSource(id)) |s| s.video_counts = counts;
+}
+
 /// Whether anything on screen changes by itself (live levels), so the platform paints a
 /// frame for every one the display shows.
 pub fn animating() bool {
@@ -689,7 +811,7 @@ pub fn animating() bool {
     // when expanded again.
     if (state.settings.collapsed) return false;
     // The elapsed time, on the timeline.
-    if (state.recording) return true;
+    if (state.mode == .recording) return true;
     for (state.sources.items) |s| {
         if (s.status == .live and !s.kind.isVideo()) return true;
     }
@@ -776,8 +898,29 @@ pub fn setDeviceLevels(levels: ?[]const DeviceLevel) void {
 
 /// Whether the open menu changes by itself (live levels), so the platform repaints it every
 /// frame.
+/// Whether the open menu shows something that changes by itself: device levels, or a live
+/// webcam's frame counts. See menuChanged.
 pub fn menuAnimating() bool {
-    return state.device_levels != null;
+    if (state.device_levels != null) return true;
+    const id = switch (state.menu orelse return false) {
+        .track => |id| id,
+        .devices, .todo, .more => return false,
+    };
+    const src = findSource(id) orelse return false;
+    return src.video_counts != null and src.status == .live;
+}
+
+/// While menuAnimating: whether a frame now would look any different. Levels move every
+/// frame; the counts only when a frame is encoded or dropped (a camera's rate, not the
+/// display's).
+pub fn menuChanged() bool {
+    if (state.device_levels != null) return true;
+    const id = switch (state.menu orelse return false) {
+        .track => |id| id,
+        .devices, .todo, .more => return false,
+    };
+    const src = findSource(id) orelse return false;
+    return !std.meta.eql(src.frameCounts(), state.track_menu_frames);
 }
 
 /// Where the open menu goes, in our window's client coordinates: under the button that
@@ -796,6 +939,7 @@ pub fn menuRect(dpi: u32, measure: anytype) Rect {
     for (0..menuRowCount(menu)) |i| {
         const row = menuRow(menu, i);
         var text_w = measure.width(row.text.slice(), .normal);
+        if (row.reserve) |reserve| text_w = @max(text_w, measure.width(reserve, .normal));
         if (row.note != null) text_w += s.px(menu_note_gap_px) + state.menu_note_w + 2 * s.px(menu_tag_pad_px);
         state.menu_w = @max(state.menu_w, menuTextLeft(menu, s) + text_w + s.px(menu_text_right_px));
     }
@@ -837,6 +981,9 @@ const MenuRow = struct {
     /// A checkmark in the menu's check column, at the left.
     checked: bool = false,
     divider_below: bool = false,
+    /// For text that changes while the menu is open (live counts): the menu is made at
+    /// least this wide for it, so it has room to grow without the menu changing size.
+    reserve: ?[]const u8 = null,
 };
 
 /// Menu text, formatted without allocating: each formatted kind has room for its longest.
@@ -844,6 +991,12 @@ const MenuText = union(enum) {
     static: []const u8,
     format: AudioFormat.Text.Formatted,
     captured_as: AudioFormat.CapturedAsText.Formatted,
+    video_captured_as: VideoFormat.CapturedAsText.Formatted,
+    encoder: EncoderText.Formatted,
+    camera_format: CameraFormatText.Formatted,
+    gpu: GpuText.Formatted,
+    bitrate: BitrateText.Formatted,
+    frames: FramesText.Formatted,
     clips: ClipsText.Formatted,
     buffer: BufferText.Formatted,
 
@@ -861,6 +1014,44 @@ const BufferText = maxstring.MaxString(.utf8, .no_sentinel, &.{
     .{ .static = " KB (" },
     .{ .runtime_value = .{ .name = "ms", .type = u32 } },
     .{ .static = " ms)" },
+});
+
+const EncoderText = maxstring.MaxString(.utf8, .no_sentinel, &.{
+    .{ .static = "Encoded by " },
+    .{ .runtime_utf8 = .{ .name = "name", .max_len = 64 } },
+});
+
+const CameraFormatText = maxstring.MaxString(.utf8, .no_sentinel, &.{
+    .{ .static = "Camera sends " },
+    .{ .runtime_utf8 = .{ .name = "format", .max_len = 36 } },
+    .{ .runtime_utf8 = .{ .name = "converted", .max_len = converted_text.len } },
+});
+const converted_text = ", converted for the encoder";
+
+const GpuText = maxstring.MaxString(.utf8, .no_sentinel, &.{
+    .{ .static = "On " },
+    .{ .runtime_utf8 = .{ .name = "name", .max_len = 64 } },
+});
+
+/// The rate in Mbit/s, to a tenth.
+const BitrateText = maxstring.MaxString(.utf8, .no_sentinel, &.{
+    .{ .static = "Target bitrate " },
+    .{ .runtime_value = .{ .name = "mbit", .type = u32 } },
+    .{ .static = "." },
+    .{ .runtime_value = .{ .name = "tenth", .type = u32 } },
+    .{ .static = " Mbit/s" },
+});
+
+/// The room the live frame counts have to grow into (see MenuRow.reserve): over 38 days of
+/// frames at 30 fps, a million dropped.
+const frames_reserve = "Frames: 99999999 encoded, 999999 dropped";
+
+const FramesText = maxstring.MaxString(.utf8, .no_sentinel, &.{
+    .{ .static = "Frames: " },
+    .{ .runtime_value = .{ .name = "encoded", .type = u64 } },
+    .{ .static = " encoded, " },
+    .{ .runtime_value = .{ .name = "dropped", .type = u64 } },
+    .{ .static = " dropped" },
 });
 
 const ClipsText = maxstring.MaxString(.utf8, .no_sentinel, &.{
@@ -906,23 +1097,61 @@ fn menuRow(menu: Menu, i: usize) MenuRow {
             // A divider between what the track is and what can be done with it.
             const last_info = i + 1 < rows.len and switch (rows[i + 1]) {
                 .clips, .remove => true,
-                .name, .device_format, .captured_as, .effects, .buffer => false,
+                .name, .device_format, .captured_as, .camera_format, .effects, .encoder, .gpu, .bitrate, .frames, .buffer => false,
             };
             return switch (rows[i]) {
                 .name => .{ .item = null, .text = .{ .static = src.name() }, .icon = src.icon(), .divider_below = last_info },
                 .device_format => .{ .item = null, .text = formatText(src.device.?.format), .divider_below = last_info },
                 .captured_as => .{ .item = null, .text = switch (src.status) {
-                    .live => |live| .{ .captured_as = live.format.capturedAsText() },
+                    .live => |live| switch (live) {
+                        .audio => |a| .{ .captured_as = a.format.capturedAsText() },
+                        .video => |v| .{ .video_captured_as = v.format.capturedAsText() },
+                    },
                     .starting => .{ .static = "Captured as: starting..." },
                     .failed => .{ .static = "Captured as: not capturing" },
                 }, .divider_below = last_info },
                 .effects => .{ .item = null, .text = .{ .static = switch (src.status) {
-                    .live => |live| if (live.raw)
+                    .live => |live| if (live.audio.raw)
                         "Raw: Windows audio effects bypassed"
                     else
                         "Windows audio effects may apply (no raw support)",
                     .starting, .failed => "Windows audio effects: unknown until capturing",
                 } }, .divider_below = last_info },
+                .encoder => switch (src.status) {
+                    .live => |*live| .{
+                        .item = null,
+                        .text = .{ .encoder = EncoderText.format(.{ .name = live.video.encoder() }) },
+                        .note = live.video.path.note(),
+                        .divider_below = last_info,
+                    },
+                    .starting, .failed => .{ .item = null, .text = .{ .static = "Encoder: unknown until capturing" }, .divider_below = last_info },
+                },
+                .camera_format => .{ .item = null, .text = switch (src.status) {
+                    .live => |*live| .{ .camera_format = CameraFormatText.format(.{
+                        .format = live.video.cameraFormat(),
+                        .converted = if (live.video.camera_converted) converted_text else "",
+                    }) },
+                    .starting, .failed => .{ .static = "Camera's format: unknown until capturing" },
+                }, .divider_below = last_info },
+                .gpu => .{ .item = null, .text = switch (src.status) {
+                    .live => |*live| if (live.video.path == .software)
+                        .{ .static = "On the CPU" }
+                    else
+                        .{ .gpu = GpuText.format(.{ .name = live.video.gpu() }) },
+                    .starting, .failed => .{ .static = "GPU: unknown until capturing" },
+                }, .divider_below = last_info },
+                .bitrate => .{ .item = null, .text = switch (src.status) {
+                    .live => |live| .{ .bitrate = BitrateText.format(.{
+                        .mbit = live.video.bitrate / 1_000_000,
+                        .tenth = live.video.bitrate / 100_000 % 10,
+                    }) },
+                    .starting, .failed => .{ .static = "Target bitrate: unknown until capturing" },
+                }, .divider_below = last_info },
+                // Live: the counts as this paint took them (see paintMenu).
+                .frames => .{ .item = null, .text = .{ .frames = FramesText.format(.{
+                    .encoded = state.track_menu_frames.encoded,
+                    .dropped = state.track_menu_frames.dropped,
+                }) }, .divider_below = last_info, .reserve = frames_reserve },
                 .buffer => .{ .item = null, .text = if (src.buffer) |b|
                     .{ .buffer = BufferText.format(.{ .kb = @intCast(b.bytes / 1024), .ms = b.ms }) }
                 else
@@ -1035,8 +1264,12 @@ fn hitTest(x: i32, y: i32) Hot {
 /// The record button: start or stop recording. Returns false when it's disabled.
 fn primaryAction() bool {
     if (!recordEnabled()) return false;
-    state.recording = !state.recording;
-    if (state.recording) {
+    state.mode = switch (state.mode) {
+        .idle => .recording,
+        .recording => .idle,
+        .closing => unreachable, // recordEnabled
+    };
+    if (state.mode == .recording) {
         state.recording_error = null;
         for (state.sources.items) |*src| src.record_error = null;
     }
@@ -1046,19 +1279,33 @@ fn primaryAction() bool {
 /// Whether the user wants to be recording. The platform starts and stops the recording to
 /// match, see recordingFailed.
 pub fn isRecording() bool {
-    return state.recording;
+    return state.mode == .recording;
+}
+
+/// Quit was asked for while recording, or while a recording's files are still being finished:
+/// recording stops, nothing new can start, and the top bar says the window closes once the
+/// files are done (the platform closes it then, if it's still closing: see recordingProblem).
+pub fn closeWhenFinished() void {
+    state.mode = .closing;
+}
+
+pub fn isClosing() bool {
+    return state.mode == .closing;
 }
 
 /// The recording as a whole couldn't start or continue: it stops, and the message shows in
-/// the top bar until the next one.
+/// the top bar until the next one. While closing, it stops closing too (see recordingProblem).
 pub fn recordingFailed(message: Message) void {
-    state.recording = false;
+    state.mode = .idle;
     state.recording_error = message;
 }
 
 /// A problem with a recording that stopped nothing (its progress couldn't be saved, or one
 /// being finished failed): shown in the top bar like a failure, until the next recording.
+/// While closing, it stops closing: the window stays, so the problem is seen, not closed
+/// over; quitting again closes it.
 pub fn recordingProblem(message: Message) void {
+    if (state.mode == .closing) state.mode = .idle;
     state.recording_error = message;
 }
 
@@ -1126,7 +1373,9 @@ pub fn paint(p: anytype, width: i32, height: i32, dpi: u32) void {
         paintToggle(p, state.minimize_button, .minimize, false, look(.minimize_button));
 
         const status_r = line(state.button.right + s.px(12), state.minimize_button.left - s.px(8), top, bar_h);
-        if (state.recording_error) |*m| {
+        if (state.mode == .closing) {
+            p.text(closing_text, status_r, .small, color.text, .left);
+        } else if (state.recording_error) |*m| {
             p.text(m.slice(), status_r, .small, color.amber, .left);
         } else {
             paintStatus(p, s, status_r);
@@ -1172,6 +1421,8 @@ fn captureWarning(buf: []u8) ?[]const u8 {
     };
 }
 
+const closing_text = "Finishing the recording\u{2026} Black Box closes when it's done";
+
 /// The recording time the disk has room for (an estimate, see averageRate), then faintly,
 /// what it's from: free space and the rate.
 fn paintStatus(p: anytype, s: Scale, r: Rect) void {
@@ -1200,15 +1451,22 @@ fn paintStatus(p: anytype, s: Scale, r: Rect) void {
 fn averageRate() ?f64 {
     var bps: f64 = 0;
     for (state.sources.items) |src| switch (src.status) {
-        .live => |live| {
-            const device_bits = if (src.device) |d| if (d.format) |f| f.bits else null else null;
-            const bits: f64 = @floatFromInt(@min(device_bits orelse live.format.bits, 24));
-            bps += @as(f64, @floatFromInt(live.format.rate)) * @as(f64, @floatFromInt(live.format.channels)) * bits / 8 * typical_flac_ratio;
+        .live => |live| switch (live) {
+            .audio => |a| {
+                const device_bits = if (src.device) |d| if (d.format) |f| f.bits else null else null;
+                const bits: f64 = @floatFromInt(@min(device_bits orelse a.format.bits, 24));
+                bps += @as(f64, @floatFromInt(a.format.rate)) * @as(f64, @floatFromInt(a.format.channels)) * bits / 8 * typical_flac_ratio;
+            },
+            .video => |v| bps += @as(f64, @floatFromInt(v.bitrate)) / 8 * typical_video_ratio,
         },
         .starting, .failed => {},
     };
     return if (bps > 0) bps else null;
 }
+
+/// What a webcam's video typically takes of its encoder's target rate: a webcam's picture is
+/// mostly still. A first test (a laptop's 1080p camera, a person at a desk) took 30-45%.
+const typical_video_ratio = 0.4;
 
 /// What FLAC typically shrinks audio to. A first recording's tracks (three mics, an output)
 /// took 37% (quiet mics) to 92% (music) of their 16-bit size, 62% on average.
@@ -1246,7 +1504,11 @@ fn formatDuration(seconds: u64, w: *std.Io.Writer) std.Io.Writer.Error!void {
 /// Whether the record button does anything: there must be something to record, but a
 /// recording can always be stopped.
 fn recordEnabled() bool {
-    return state.recording or state.sources.items.len > 0;
+    return switch (state.mode) {
+        .idle => state.sources.items.len > 0,
+        .recording => true,
+        .closing => false,
+    };
 }
 
 /// How a button looks: the mouse over it, or pressed (the press started on it and the mouse
@@ -1273,7 +1535,7 @@ fn paintRecordButton(p: anytype, s: Scale) void {
     const dot_y = r.top + @divTrunc(r.bottom - r.top - dot, 2);
     p.ellipse(.{ .left = dot_x, .top = dot_y, .right = dot_x + dot, .bottom = dot_y + dot }, if (!enabled)
         color.disabled
-    else if (state.recording)
+    else if (state.mode == .recording)
         color.record
     else
         color.text);
@@ -1340,6 +1602,18 @@ fn paintViewer(p: anytype, s: Scale, viewer: Rect) void {
         if (src.kind.isVideo()) video_count += 1 else audio_count += 1;
     }
 
+    // Audio on a timeline, each track a lane of its levels; video as tiles below, each its
+    // picture and state. (A lane is for seeing sound over time; what's useful of a webcam
+    // while recording is that it's working, and how it's framed.)
+    // The timeline (the recording's time, the playhead) whatever's being recorded.
+    const tiles_top = paintTimeline(p, s, area, audio_count) + gap;
+    if (video_count > 0) paintVideoTiles(p, s, .{ .left = area.left, .top = tiles_top, .right = area.right, .bottom = area.bottom }, video_count);
+}
+
+/// The timeline and the audio tracks under it (if any), from `area`'s top: returns where
+/// they end.
+fn paintTimeline(p: anytype, s: Scale, area: Rect, audio_count: i32) i32 {
+    const gap = s.px(8);
     // Columns shared by the timeline and the tracks, so they line up.
     const icon_w = s.px(36);
     const wave_left = area.left + icon_w;
@@ -1349,7 +1623,7 @@ fn paintViewer(p: anytype, s: Scale, viewer: Rect) void {
     const timeline_h = s.px(20);
     const timeline_bottom = timeline_top + timeline_h;
     const tracks_top = timeline_bottom + gap;
-    const tracks_bottom = tracks_top + video_count * (s.px(video_track_px) + gap) + audio_count * (s.px(audio_track_px) + gap) - gap;
+    const tracks_bottom = if (audio_count == 0) timeline_bottom else tracks_top + audio_count * (s.px(audio_track_px) + gap) - gap;
 
     // Timeline, above the tracks.
     {
@@ -1363,49 +1637,32 @@ fn paintViewer(p: anytype, s: Scale, viewer: Rect) void {
             std.fmt.bufPrint(&time_buf, "{d}:{d:0>2}", .{ elapsed_s / 60, elapsed_s % 60 }) catch unreachable
         else
             std.fmt.bufPrint(&time_buf, "{d}:{d:0>2}:{d:0>2}", .{ elapsed_s / 3600, elapsed_s / 60 % 60, elapsed_s % 60 }) catch unreachable;
-        p.text(time, .{ .left = area.left, .top = timeline_top, .right = wave_left, .bottom = timeline_bottom }, .small, if (state.recording) color.text else color.dim, .center);
+        p.text(time, .{ .left = area.left, .top = timeline_top, .right = wave_left, .bottom = timeline_bottom }, .small, if (state.mode == .recording) color.text else color.dim, .center);
     }
 
-    // Tracks: video first, then audio. Just an icon, no name; the icon opens the track's menu.
-    {
-        var y = tracks_top;
-        for ([2]bool{ true, false }) |video_pass| for (state.sources.items) |*src| {
-            if (src.kind.isVideo() != video_pass) continue;
-            const track_h = s.px(if (video_pass) video_track_px else audio_track_px);
-            const r: Rect = .{ .left = area.left, .top = y, .right = area.right, .bottom = y + track_h };
-            p.fill(r, color.tile);
-            const icon_r: Rect = .{ .left = r.left, .top = r.top, .right = r.left + icon_w, .bottom = r.bottom };
-            src.track_button = icon_r;
-            const menu_open = menuIs(.track) and state.menu.?.track == src.id;
-            switch (look(.{ .track = src.id })) {
-                .pressed => p.fill(icon_r, color.tile_pressed),
-                .hot => p.fill(icon_r, color.tile_hot),
-                .normal => if (menu_open) p.fill(icon_r, color.tile_hot),
-            }
-            p.icon(src.icon(), icon_r, .icon_small, color.text);
-            paintClipBadge(p, s, icon_r, src.clips());
-            const lane: Rect = .{ .left = wave_left, .top = r.top + s.px(4), .right = wave_right, .bottom = r.bottom - s.px(4) };
-            if (src.kind.isVideo()) {
-                // TODO: thumbnails, and marks where frames were dropped.
-                p.fill(lane, color.video);
-            }
-            switch (src.status) {
-                .live => if (!src.kind.isVideo()) {
-                    src.painted_width = @intCast(@max(lane.right - lane.left, 0));
-                    src.painted_columns = paintLevels(p, s, lane, src.meter.?);
-                },
-                .starting => p.text("Starting...", lane.inset(s.px(8), 0), .small, color.dim, .left),
-                .failed => |*m| p.text(m.slice(), lane.inset(s.px(8), 0), .small, color.amber, .left),
-            }
-            // What it is, over its lane: the icon says what kind of device, this which one.
-            paintTrackLabel(p, s, lane, src.name());
-            if (src.record_error) |*m| {
-                const r_err = lane.inset(s.px(4), s.px(4));
-                p.fill(r_err, color.window);
-                p.text(m.slice(), r_err.inset(s.px(4), 0), .small, color.amber, .left);
-            }
-            y += track_h + gap;
-        };
+    // Tracks. Just an icon, no name; the icon opens the track's menu.
+    var y = tracks_top;
+    for (state.sources.items) |*src| {
+        if (src.kind.isVideo()) continue;
+        const track_h = s.px(audio_track_px);
+        const r: Rect = .{ .left = area.left, .top = y, .right = area.right, .bottom = y + track_h };
+        p.fill(r, color.tile);
+        const icon_r: Rect = .{ .left = r.left, .top = r.top, .right = r.left + icon_w, .bottom = r.bottom };
+        paintTrackButton(p, src, icon_r);
+        paintClipBadge(p, s, icon_r, src.clips());
+        const lane: Rect = .{ .left = wave_left, .top = r.top + s.px(4), .right = wave_right, .bottom = r.bottom - s.px(4) };
+        switch (src.status) {
+            .live => {
+                src.painted_width = @intCast(@max(lane.right - lane.left, 0));
+                src.painted_columns = paintLevels(p, s, lane, src.meter.?);
+            },
+            .starting => p.text("Starting...", lane.inset(s.px(8), 0), .small, color.dim, .left),
+            .failed => |*m| p.text(m.slice(), lane.inset(s.px(8), 0), .small, color.amber, .left),
+        }
+        // What it is, over its lane: the icon says what kind of device, this which one.
+        paintTrackLabel(p, s, lane, src.name());
+        paintRecordError(p, s, lane, src);
+        y += track_h + gap;
     }
 
     // Playhead, across the timeline and every track. At "now" (live) until scrubbing exists.
@@ -1414,36 +1671,78 @@ fn paintViewer(p: anytype, s: Scale, viewer: Rect) void {
         const x = wave_right - w;
         p.fill(.{ .left = x, .top = timeline_top, .right = x + w, .bottom = tracks_bottom }, color.text);
     }
+    return tracks_bottom;
+}
 
-    // Video previews side by side below, each as large as fits at 16:9.
-    if (video_count > 0) {
-        const region_top = tracks_bottom + gap;
-        const region_h = area.bottom - region_top;
-        var tile_w = @divTrunc(area.right - area.left - (video_count - 1) * gap, video_count);
-        var tile_h = @divTrunc(tile_w * 9, 16);
-        if (tile_h > region_h) {
-            tile_h = region_h;
-            tile_w = @divTrunc(tile_h * 16, 9);
+/// The video sources side by side in `area`, each as large as fits at 16:9 (and no smaller
+/// than video_tile_min_px tall: its menu stays in reach in a small window). Each has its
+/// track button at its top left, its name beside it, and what it's doing in its middle.
+/// TODO: the picture, and marks where frames were dropped.
+fn paintVideoTiles(p: anytype, s: Scale, area: Rect, video_count: i32) void {
+    const gap = s.px(8);
+    var tile_w = @divTrunc(area.right - area.left - (video_count - 1) * gap, video_count);
+    var tile_h = @divTrunc(tile_w * 9, 16);
+    const region_h = area.bottom - area.top;
+    if (tile_h > region_h) {
+        tile_h = region_h;
+        tile_w = @divTrunc(tile_h * 16, 9);
+    }
+    if (tile_h < s.px(video_tile_min_px)) {
+        tile_h = s.px(video_tile_min_px);
+        tile_w = @divTrunc(tile_h * 16, 9);
+    }
+    const row_w = video_count * tile_w + (video_count - 1) * gap;
+    var x = area.left + @max(0, @divTrunc(area.right - area.left - row_w, 2));
+    const button_w = s.px(36);
+    for (state.sources.items) |*src| {
+        if (!src.kind.isVideo()) continue;
+        const r: Rect = .{ .left = x, .top = area.top, .right = x + tile_w, .bottom = area.top + tile_h };
+        x += tile_w + gap;
+        p.fill(r, color.video);
+        const button: Rect = .{ .left = r.left, .top = r.top, .right = r.left + button_w, .bottom = r.top + button_w };
+        paintTrackButton(p, src, button);
+        paintClipBadge(p, s, button, src.clips());
+        paintTrackLabel(p, s, .{ .left = button.right, .top = r.top + s.px(8), .right = r.right, .bottom = r.bottom }, src.name());
+        // What it's doing, in the middle: its format once live, until there's a picture.
+        const body: Rect = .{ .left = r.left + s.px(8), .top = button.bottom, .right = r.right - s.px(8), .bottom = r.bottom - s.px(8) };
+        switch (src.status) {
+            .live => |live| {
+                var buf: [64]u8 = undefined;
+                const f = live.video.format;
+                const fps = if (f.fps_den == 0) 0 else (f.fps_num + f.fps_den / 2) / f.fps_den;
+                const text = std.fmt.bufPrint(&buf, "{d}x{d} at {d} fps", .{ f.width, f.height, fps }) catch unreachable;
+                p.text(text, body, .small, color.dim, .center);
+            },
+            .starting => p.text("Starting...", body, .small, color.dim, .center),
+            .failed => |*m| p.text(m.slice(), body, .small, color.amber, .center),
         }
-        if (tile_h > 0) {
-            const row_w = video_count * tile_w + (video_count - 1) * gap;
-            var x = area.left + @divTrunc(area.right - area.left - row_w, 2);
-            for (state.sources.items) |src| {
-                const kind = src.kind;
-                if (!kind.isVideo()) continue;
-                const r: Rect = .{ .left = x, .top = region_top, .right = x + tile_w, .bottom = region_top + tile_h };
-                p.fill(r, color.video);
-                const mid = r.top + @divTrunc(tile_h, 2);
-                p.icon(kind.icon(), .{ .left = r.left, .top = mid - s.px(36), .right = r.right, .bottom = mid + s.px(4) }, .icon, color.dim);
-                p.text(kind.title(), .{ .left = r.left, .top = mid + s.px(4), .right = r.right, .bottom = mid + s.px(28) }, .small, color.dim, .center);
-                x += tile_w + gap;
-            }
-        }
+        paintRecordError(p, s, .{ .left = r.left, .top = r.bottom - s.px(32), .right = r.right, .bottom = r.bottom }, src);
     }
 }
 
-const video_track_px = 36;
-/// Taller than video: room for the level meter's zones.
+/// A track's button (its icon, which opens its menu), lit when hot, pressed or open.
+fn paintTrackButton(p: anytype, src: *Source, r: Rect) void {
+    src.track_button = r;
+    const menu_open = menuIs(.track) and state.menu.?.track == src.id;
+    switch (look(.{ .track = src.id })) {
+        .pressed => p.fill(r, color.tile_pressed),
+        .hot => p.fill(r, color.tile_hot),
+        .normal => if (menu_open) p.fill(r, color.tile_hot),
+    }
+    p.icon(src.icon(), r, .icon_small, color.text);
+}
+
+/// Why recording the source failed, if it did, over `r`.
+fn paintRecordError(p: anytype, s: Scale, r: Rect, src: *const Source) void {
+    const m = src.record_error orelse return;
+    const r_err = r.inset(s.px(4), s.px(4));
+    p.fill(r_err, color.window);
+    p.text(m.slice(), r_err.inset(s.px(4), 0), .small, color.amber, .left);
+}
+
+/// Taller than a tile's track button and name: room for what it's doing too.
+const video_tile_min_px = 90;
+/// Room for the level meter's zones.
 const audio_track_px = 56;
 
 /// A track's name at its lane's top left: small, see-through so the levels show beneath it,
@@ -1653,6 +1952,13 @@ pub fn paintMenu(p: anytype, width: i32, dpi: u32) void {
     const s: Scale = .{ .dpi = dpi };
     p.clear(color.menu);
     const menu = state.menu orelse return;
+    // The live counts as of this paint (see menuChanged).
+    switch (menu) {
+        .track => |id| if (findSource(id)) |src| {
+            state.track_menu_frames = src.frameCounts();
+        },
+        .devices, .todo, .more => {},
+    }
     const hot_item = menuHot();
     const row_h = s.px(menu_row_px);
     const icon_w = s.px(menu_icon_px);
@@ -1963,12 +2269,90 @@ test "adding a device: listed in order, each added once, the list freed with the
     try std.testing.expect(!testClickMenuRow(0));
 }
 
+test "a webcam is added from its devices menu, like a microphone" {
+    init(std.testing.allocator);
+    defer deinit();
+    var p: TestPainter = .{};
+    testPaint(&p);
+    testClick(state.add_buttons[@intFromEnum(SourceKind.webcam)]);
+    try std.testing.expectEqual(Menu{ .devices = .webcam }, openMenu().?);
+    try std.testing.expectEqual(SourceKind.webcam, takeDeviceListRequest().?);
+    // The platform's webcams have no audio format or form: the webcam icon.
+    addDevice(try testDevice("Front Camera", null));
+    try std.testing.expect(!menuAnimating());
+    testPaintMenu(&p);
+    try std.testing.expectEqual(Icon.webcam, menuRow(state.menu.?, 0).icon.?);
+    try std.testing.expect(testClickMenuRow(0));
+    try std.testing.expectEqual(null, openMenu());
+    try std.testing.expectEqual(0, listedDevices().len);
+    try std.testing.expectEqual(1, sources().len);
+    try std.testing.expectEqual(SourceKind.webcam, sources()[0].kind);
+    try std.testing.expectEqualStrings("id:Front Camera", sources()[0].device.?.id);
+
+    // Live, its menu says what it captures and what encodes it, and where.
+    var live: SourceStatus.VideoLive = .{ .format = .{ .width = 1920, .height = 1080, .fps_num = 30000, .fps_den = 1001 }, .bitrate = 6_300_000, .path = .gpu, .camera_converted = true };
+    const name = "Test Encoder";
+    @memcpy(live.encoder_buf[0..name.len], name);
+    live.encoder_len = name.len;
+    const gpu_name = "Test GPU";
+    @memcpy(live.gpu_buf[0..gpu_name.len], gpu_name);
+    live.gpu_len = gpu_name.len;
+    @memcpy(live.camera_format_buf[0..4], "MJPG");
+    live.camera_format_len = 4;
+    const id = sources()[0].id;
+    setSourceStatus(id, .{ .live = .{ .video = live } });
+    // A webcam alone still has the timeline: the recording's time, and the playhead.
+    testPaint(&p);
+    try p.expectText("0:00");
+    var counts: VideoCounts = .{};
+    counts.encoded.store(1234, .monotonic);
+    counts.dropped.store(3, .monotonic);
+    setSourceVideoCounts(id, &counts);
+    testPaint(&p);
+    testClick(findSource(id).?.track_button);
+    try std.testing.expectEqual(Menu{ .track = id }, openMenu().?);
+    testPaintMenu(&p);
+    try p.expectText("Captured as 1920x1080 at 30 fps");
+    try p.expectText("Camera sends MJPG, converted for the encoder");
+    try p.expectText("Encoded by Test Encoder");
+    try p.expectText("GPU");
+    try p.expectText("On Test GPU");
+    try p.expectText("Target bitrate 6.3 Mbit/s");
+    try p.expectText("Frames: 1234 encoded, 3 dropped");
+    // The counts are live: the menu repaints when they change, and only then, and stays the
+    // size it opened at as they grow.
+    try std.testing.expect(menuAnimating());
+    try std.testing.expect(!menuChanged());
+    const opened = menuRect(96, &p);
+    counts.encoded.store(99_999_999, .monotonic);
+    try std.testing.expect(menuChanged());
+    testPaintMenu(&p);
+    try std.testing.expect(!menuChanged());
+    try p.expectText("Frames: 99999999 encoded, 3 dropped");
+    try std.testing.expectEqual(opened, menuRect(96, &p));
+    _ = closeMenu();
+    // Encoded by the CPU: no GPU to name.
+    live.path = .software;
+    setSourceStatus(id, .{ .live = .{ .video = live } });
+    testClick(findSource(id).?.track_button);
+    testPaintMenu(&p);
+    try p.expectText("On the CPU");
+    _ = closeMenu();
+
+    // No webcams: the menu says so.
+    testClick(state.add_buttons[@intFromEnum(SourceKind.webcam)]);
+    _ = takeDeviceListRequest();
+    testPaintMenu(&p);
+    try p.expectText("No webcams found");
+    try std.testing.expect(!testClickMenuRow(0));
+}
+
 test "a kind not recordable yet says so instead of adding" {
     init(std.testing.allocator);
     defer deinit();
     var p: TestPainter = .{};
     testPaint(&p);
-    for ([_]SourceKind{ .screen, .webcam }) |kind| {
+    for ([_]SourceKind{.screen}) |kind| {
         testClick(state.add_buttons[@intFromEnum(kind)]);
         try std.testing.expectEqual(Menu{ .todo = kind }, openMenu().?);
         try std.testing.expectEqual(null, takeDeviceListRequest());
@@ -1982,13 +2366,14 @@ test "a kind not recordable yet says so instead of adding" {
 
 test "a track's rows depend on its kind, never its state" {
     var buf: [std.enums.values(TrackRow).len]TrackRow = undefined;
-    const live: SourceStatus = .{ .live = .{ .format = .{ .sample = .float, .bits = 32, .rate = 48000, .channels = 2 }, .raw = true } };
+    const live: SourceStatus = .{ .live = .{ .audio = .{ .format = .{ .sample = .float, .bits = 32, .rate = 48000, .channels = 2 }, .raw = true } } };
     const statuses = [_]SourceStatus{ .starting, live, .{ .failed = .init("no device", .{}) } };
     const buffers = [_]?Buffer{ null, .{ .bytes = 1 << 20, .ms = 5000 } };
     for (std.enums.values(SourceKind)) |kind| {
         const want: []const TrackRow = switch (kind) {
             .microphone, .system_audio => &.{ .name, .device_format, .captured_as, .effects, .buffer, .clips, .remove },
-            .screen, .webcam => &.{ .name, .remove },
+            .webcam => &.{ .name, .captured_as, .camera_format, .encoder, .gpu, .bitrate, .frames, .buffer, .remove },
+            .screen => &.{ .name, .captured_as, .encoder, .gpu, .bitrate, .frames, .buffer, .remove },
         };
         for (statuses) |status| for (buffers) |buffer| {
             const src: Source = .{ .kind = kind, .id = 1, .device = null, .status = status, .buffer = buffer, .clips_cleared = 3 };
@@ -2005,7 +2390,7 @@ test "a track's menu clears the clips it showed, and removes the track" {
     addSource(.microphone, try testDevice("Mic", .microphone));
     const id = sources()[0].id;
     setSourceMeter(id, &meter);
-    setSourceStatus(id, .{ .live = .{ .format = .{ .sample = .float, .bits = 32, .rate = 48000, .channels = 2 }, .raw = true } });
+    setSourceStatus(id, .{ .live = .{ .audio = .{ .format = .{ .sample = .float, .bits = 32, .rate = 48000, .channels = 2 }, .raw = true } } });
     // Two runs of clipping: two clips.
     for ([_]f32{ 1.0, 1.2, 0.5, 1.0 }) |peak| meter.push(peak, 0.1);
     testPaint(&p);
@@ -2089,6 +2474,29 @@ test "collapsed: only the top bar shows and can be clicked" {
     try std.testing.expectEqual(16 + 36 + 16, collapsedHeight(96));
 }
 
+test "quitting while recording stops it, and says the window closes once it's finished" {
+    init(std.testing.allocator);
+    defer deinit();
+    var p: TestPainter = .{};
+    addSource(.microphone, try testDevice("Mic", .microphone));
+    testPaint(&p);
+    testClick(state.button);
+    try std.testing.expect(isRecording());
+    closeWhenFinished();
+    try std.testing.expect(!isRecording() and isClosing());
+    testPaint(&p);
+    try p.expectText(closing_text);
+    // Nothing new starts while it closes.
+    testClick(state.button);
+    try std.testing.expect(!isRecording());
+    // A problem finishing the files: it shows, and closing stops, so it isn't closed over.
+    recordingProblem(.init("Writing the recording file failed: the disk is full", .{}));
+    try std.testing.expect(!isClosing() and !isRecording());
+    testPaint(&p);
+    try p.expectText("Writing the recording file failed: the disk is full");
+    try std.testing.expect(p.find(closing_text) == null);
+}
+
 test "the more menu's Quit" {
     init(std.testing.allocator);
     defer deinit();
@@ -2122,7 +2530,7 @@ test "the status: how long the disk lasts at the tracks' rate" {
     var meter: Meter = .{};
     const id = sources()[0].id;
     setSourceMeter(id, &meter);
-    setSourceStatus(id, .{ .live = .{ .format = .{ .sample = .float, .bits = 32, .rate = 48000, .channels = 2 }, .raw = false } });
+    setSourceStatus(id, .{ .live = .{ .audio = .{ .format = .{ .sample = .float, .bits = 32, .rate = 48000, .channels = 2 }, .raw = false } } });
     testPaint(&p);
     try p.expectText("5 hours 20 minutes left");
     try p.expectText("2.2 GB \u{00B7} 115.2 KB/s");
@@ -2169,7 +2577,7 @@ test "a frame is painted only when it would look different" {
     setSourceMeter(id, &meter);
     // Starting: nothing moves yet.
     try std.testing.expect(!animating());
-    setSourceStatus(id, .{ .live = .{ .format = .{ .sample = .float, .bits = 32, .rate = 48000, .channels = 1 }, .raw = false } });
+    setSourceStatus(id, .{ .live = .{ .audio = .{ .format = .{ .sample = .float, .bits = 32, .rate = 48000, .channels = 1 }, .raw = false } } });
     try std.testing.expect(animating());
 
     testPaint(&p);

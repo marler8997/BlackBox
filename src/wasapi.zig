@@ -412,7 +412,7 @@ pub const Capture = struct {
     pub fn sourceStatus(c: *const Capture) bb.SourceStatus {
         return switch (c.status.load(.acquire)) {
             .starting => .starting,
-            .live => .{ .live = .{ .format = c.format, .raw = c.raw } },
+            .live => .{ .live = .{ .audio = .{ .format = c.format, .raw = c.raw } } },
             .failed => .{ .failed = c.failure },
         };
     }

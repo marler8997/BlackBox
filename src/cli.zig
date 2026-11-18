@@ -8,6 +8,8 @@ const usage =
     \\  blackbox recover FOLDER   finish the files of a recording a crash or power cut
     \\                            interrupted, from its checkpoint and journal. If those are
     \\                            damaged, says how and removes nothing.
+    \\  blackbox webcams          list the webcams, the formats each delivers, and the H.264
+    \\                            encoders that could record them.
     \\
 ;
 
@@ -63,6 +65,13 @@ fn run(init: std.process.Init.Minimal) !u8 {
         }
         return recover(gpa, io, dir);
     }
+    if (std.mem.eql(u8, command, "webcams")) {
+        if (args.next() != null) {
+            try print(io, .stderr(), "blackbox webcams takes no arguments\n\n" ++ usage, .{});
+            return 1;
+        }
+        return webcams(io);
+    }
     try print(io, .stderr(), "blackbox: unknown command '{s}'\n\n" ++ usage, .{command});
     return 1;
 }
@@ -98,6 +107,23 @@ fn recover(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !u8 {
     return if (failures.items.len == 0) 0 else 1;
 }
 
+fn webcams(io: std.Io) !u8 {
+    if (native_os != .windows) {
+        try print(io, .stderr(), "blackbox webcams: webcams are Windows only for now\n", .{});
+        return 1;
+    }
+    {
+        const hr = win32.CoInitializeEx(null, win32.COINIT_MULTITHREADED);
+        if (hr.failed) win32.panicHresult("CoInitializeEx", hr);
+    }
+    defer win32.CoUninitialize();
+    var buf: [1024]u8 = undefined;
+    var file_writer = std.Io.File.stdout().writerStreaming(io, &buf);
+    webcam.probe(&file_writer.interface) catch return file_writer.err.?;
+    file_writer.interface.flush() catch return file_writer.err.?;
+    return 0;
+}
+
 /// Prints to stdout or stderr. A failed write is the file's own error (WriteFailed only
 /// says that one happened).
 fn print(io: std.Io, file: std.Io.File, comptime fmt: []const u8, args: anytype) std.Io.File.Writer.Error!void {
@@ -112,3 +138,5 @@ const native_os = builtin.os.tag;
 const std = @import("std");
 const wintrace = @import("wintrace");
 const record = if (native_os == .windows) @import("record.zig") else struct {};
+const webcam = if (native_os == .windows) @import("webcam.zig") else struct {};
+const win32 = @import("win32").everything;
