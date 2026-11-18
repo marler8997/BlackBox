@@ -441,6 +441,10 @@ pub const Recording = struct {
     lock_file: win32.HANDLE,
     /// The writer is done, recording_end written or not (it isn't after a write failed).
     writer_exited: std.atomic.Value(bool) = .init(false),
+    /// Journal bytes written (by the writer) and read (by the compressor), all its files: what's
+    /// left to finish is their difference, see bytesLeft.
+    journal_written: std.atomic.Value(u64) = .init(0),
+    journal_read: std.atomic.Value(u64) = .init(0),
 
     // The window's thread only.
     /// Tracks added, for unique file names and adding each source once.
@@ -539,6 +543,12 @@ pub const Recording = struct {
         if (builtin.mode == .debug) _ = r.debug_allocator.deinit();
         global_gpa.destroy(r);
         return .{ .failed = fail_message };
+    }
+
+    /// Journal bytes the compressor has yet to read: how much finishing the files has left
+    /// (once the writer's done). From any thread.
+    pub fn bytesLeft(r: *Recording) u64 {
+        return r.journal_written.load(.monotonic) -| r.journal_read.load(.monotonic);
     }
 
     /// From the window's thread: a writer for a source's track, or null if the source was
@@ -1072,6 +1082,9 @@ fn nextSegment(r: *Recording, need: u64) bool {
 /// Writes a chunk at the write position, which the caller made room for.
 fn writeRaw(r: *Recording, header: journal.Header, payload: []const []const u8) void {
     if (r.write_failed) return;
+    defer if (!r.write_failed) {
+        _ = r.journal_written.fetchAdd(header.size(), .monotonic);
+    };
     var h = header;
     h.journal_seq = r.journal_seq;
     h.write_qpc = qpc100ns();
@@ -2324,6 +2337,8 @@ fn readChunks(c: *Compressor, end: u64) Corrupt!bool {
             else => try processChunk(c, h, payload, .{ .segment_index = c.segment_index, .offset = c.offset, .seq = h.journal_seq }),
         }
         c.offset += h.size();
+        _ = c.recording.journal_read.fetchAdd(h.size(), .monotonic);
+        if (simulate_slow_compressor and !builtin.is_test) win32.Sleep(200);
         any = true;
         if (c.test_checkpoint_chunks != 0 and c.next_seq % c.test_checkpoint_chunks == 0) checkpoint(c);
     }
@@ -2598,6 +2613,12 @@ fn checkVideoTrackStart(c: *Compressor, id: u32, start: journal.VideoTrackStart)
         start.encoder_name_len > max_encoder_name or start.novideo_len > max_novideo)
         return c.corrupt(.{ .track_names = .{ .track = id } });
 }
+
+/// Left in the codebase to test the quit codepath when the compressor isn't finished flushing:
+/// true, it pauses 200 ms after each journal chunk, falling behind while recording, so finishing
+/// takes long enough to see the closing state, Force Quit and its countdown. Not in the tests,
+/// which replay thousands of chunks.
+const simulate_slow_compressor = false;
 
 /// The longest encoder name a video track start has: TrackInfo.Video's.
 const max_encoder_name = @typeInfo(@FieldType(TrackInfo.Video, "encoder_buf")).array.len;

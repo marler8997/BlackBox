@@ -222,9 +222,13 @@ const Window = struct {
     /// Popup that shows bb's menus, see menuWndProc. We own it, so Windows destroys it with
     /// us, just before our WM_DESTROY.
     menu_hwnd: win32.HWND,
+    /// Popup beside the menu for what it has no room to say (bb.menuNote), see noteWndProc.
+    /// Owned too.
+    note_hwnd: win32.HWND,
     gpu: ?Gpu = null,
     main_target: ?Target = null,
     menu_target: ?Target = null,
+    note_target: ?Target = null,
     text_formats: ?TextFormats = null,
     tracking_mouse: bool = false,
     /// The menu menu_hwnd is showing, see syncMenu.
@@ -241,6 +245,12 @@ const Window = struct {
     recording: ?*record.Recording = null,
     /// Stopped recordings whose files are still being finished.
     finishing: std.ArrayList(*record.Recording) = .empty,
+    /// While quitting waits for them (bb.isClosing): how much they had left when first measured,
+    /// and when, to tell how fast it's going (see measureFinishing).
+    finishing_measured: ?struct { bytes: u64, qpc: u64 } = null,
+    /// Whether the note popup is up: it comes and goes with the open menu, but also with bb's
+    /// mode while the menu stays open (see syncMenu).
+    note_shown: bool = false,
     /// bb's window settings as last applied, see syncWindow.
     collapsed: bool = false,
     always_on_top: bool = false,
@@ -253,7 +263,7 @@ const Window = struct {
     icon_small: ?win32.HICON = null,
 
     fn create(hwnd: win32.HWND, hinstance: win32.HINSTANCE) void {
-        global.window = .{ .hwnd = hwnd, .menu_hwnd = undefined, .hinstance = hinstance, .exclude_from_capture = bb.settings().exclude_from_capture };
+        global.window = .{ .hwnd = hwnd, .menu_hwnd = undefined, .note_hwnd = undefined, .hinstance = hinstance, .exclude_from_capture = bb.settings().exclude_from_capture };
         const w = &global.window.?;
         applyCaptureExclusion(hwnd);
         setIcons(w);
@@ -276,6 +286,22 @@ const Window = struct {
             null,
         ) orelse win32.panicWin32("CreateWindowEx(menu)", win32.GetLastError());
         applyCaptureExclusion(w.menu_hwnd);
+        // The same: shown with a menu that has a note.
+        w.note_hwnd = win32.CreateWindowExW(
+            .{ .NOREDIRECTIONBITMAP = 1, .TOOLWINDOW = 1, .NOACTIVATE = 1 },
+            note_class_name,
+            null,
+            win32.WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            hwnd,
+            null,
+            hinstance,
+            null,
+        ) orelse win32.panicWin32("CreateWindowEx(note)", win32.GetLastError());
+        applyCaptureExclusion(w.note_hwnd);
 
         {
             const dark: win32.BOOL = 1;
@@ -306,6 +332,7 @@ const Window = struct {
         if (w.icon_small) |i| destroyIcon(i);
         if (w.text_formats) |*t| t.deinit();
         if (w.menu_target) |*t| t.deinit();
+        if (w.note_target) |*t| t.deinit();
         if (w.main_target) |*t| t.deinit();
         if (w.gpu) |*g| g.deinit();
         global.window = null;
@@ -346,6 +373,7 @@ const max_text = 512;
 
 const window_class_name = win32.L("BlackBoxMainWindow");
 const menu_class_name = win32.L("BlackBoxMenu");
+const note_class_name = win32.L("BlackBoxNote");
 const disk_timer_id = 1;
 /// While webcams are being removed: see removingTick.
 const removing_timer_id = 2;
@@ -565,6 +593,10 @@ pub fn main() void {
         menu_wc.lpfnWndProc = menuWndProc;
         menu_wc.lpszClassName = menu_class_name;
         if (0 == win32.RegisterClassExW(&menu_wc)) win32.panicWin32("RegisterClassEx(menu)", win32.GetLastError());
+        var note_wc = wc;
+        note_wc.lpfnWndProc = noteWndProc;
+        note_wc.lpszClassName = note_class_name;
+        if (0 == win32.RegisterClassExW(&note_wc)) win32.panicWin32("RegisterClassEx(note)", win32.GetLastError());
     }
 
     // No title bar (see WM_NCCALCSIZE/WM_NCHITTEST), but still a regular overlapped window, so
@@ -653,6 +685,7 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
             switch (wparam) {
                 disk_timer_id => {
                     refreshDisk();
+                    if (bb.isClosing()) measureFinishing(w) else w.finishing_measured = null;
                     win32.invalidateHwnd(hwnd);
                 },
                 removing_timer_id => removingTick(w),
@@ -812,7 +845,8 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         // Alt+F4, the taskbar's close. Not DefWindowProc, which would destroy the window:
         // main does that.
         win32.WM_CLOSE => {
-            // As the menu's Quit: asked first while recording.
+            // As the menu's Quit, never its Force Quit: closing the window again while the files
+            // finish keeps waiting for them.
             bb.requestQuit();
             syncWindow(w);
             return 0;
@@ -867,6 +901,45 @@ fn menuWndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.L
         },
         else => return win32.DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+/// The note beside a menu (bb.menuNote): something to read, not click. The menu has the mouse
+/// capture while it's open, so the note gets no clicks; it never takes activation. Lives as
+/// the menu does.
+fn noteWndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM) callconv(.winapi) win32.LRESULT {
+    switch (msg) {
+        win32.WM_MOUSEACTIVATE => return win32.MA_NOACTIVATE,
+        win32.WM_CLOSE => return 0,
+        win32.WM_PAINT => {
+            paint(&global.window.?, .note);
+            return 0;
+        },
+        else => return win32.DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// While quitting waits for the recording's files: how much finishing them has left, and from
+/// how fast that went down since the first measure, about how long, for bb (once a second, on
+/// the disk timer). Since the first, not the last: the compressor reads in bursts (a second of
+/// video, then little), and one second's rate would swing the estimate with them.
+fn measureFinishing(w: *Window) void {
+    var bytes: u64 = 0;
+    for (w.finishing.items) |r| bytes += r.bytesLeft();
+    const now = record.qpc100ns();
+    const first = w.finishing_measured orelse {
+        w.finishing_measured = .{ .bytes = bytes, .qpc = now };
+        bb.setFinishingLeft(.{ .bytes = bytes, .seconds = null });
+        return win32.invalidateHwnd(w.note_hwnd);
+    };
+    const seconds: ?u64 = blk: {
+        if (bytes >= first.bytes or now <= first.qpc) break :blk null;
+        const done: f64 = @floatFromInt(first.bytes - bytes);
+        const elapsed: f64 = @floatFromInt(now - first.qpc);
+        break :blk @intFromFloat(@ceil(@as(f64, @floatFromInt(bytes)) * elapsed / done / 10_000_000));
+    };
+    bb.setFinishingLeft(.{ .bytes = bytes, .seconds = seconds });
+    // Its note, if Force Quit's is showing.
+    win32.invalidateHwnd(w.note_hwnd);
 }
 
 /// Starts or stops recording to match bb. A stopped recording's files are finished in the
@@ -1144,12 +1217,22 @@ fn syncMenu(w: *Window) void {
             if (0 == win32.ReleaseCapture()) win32.panicWin32("ReleaseCapture", win32.GetLastError());
         }
         _ = win32.ShowWindow(w.menu_hwnd, win32.SW_HIDE);
+        _ = win32.ShowWindow(w.note_hwnd, win32.SW_HIDE);
+        w.note_shown = false;
         // After hiding, so a slow device can't hold the menu on screen.
         stopMeters(w);
         w.frame_clock.setAnimating(bb.animating());
         return;
     };
-    if (w.menu_shown) |shown| if (std.meta.eql(shown, menu)) return;
+    if (w.menu_shown) |shown| if (std.meta.eql(shown, menu)) {
+        // The same menu, but bb's mode can change it while it's open (closing ends: Force Quit
+        // is Quit again, its note goes).
+        if ((bb.menuNote() != null) != w.note_shown) {
+            syncNote(w);
+            win32.invalidateHwnd(w.menu_hwnd);
+        }
+        return;
+    };
     // A different menu: the last one's levels, if any, go.
     stopMeters(w);
     w.menu_shown = menu;
@@ -1183,6 +1266,7 @@ fn syncMenu(w: *Window) void {
     if (0 == win32.SetWindowPos(w.menu_hwnd, null, placed.left, placed.top, size.cx, size.cy, .{ .SHOWWINDOW = 1, .NOACTIVATE = 1 }))
         win32.panicWin32("SetWindowPos(menu)", win32.GetLastError());
     win32.invalidateHwnd(w.menu_hwnd);
+    syncNote(w);
     // Frames for what it shows live (levels, a webcam's counts), see bb.menuAnimating.
     w.frame_clock.setAnimating(bb.animating());
     // Only if it doesn't have it already, from a menu it showed before this one (picking a
@@ -1191,6 +1275,30 @@ fn syncMenu(w: *Window) void {
     _ = win32.SetCapture(w.menu_hwnd);
     const capture = win32.GetCapture();
     if (capture != w.menu_hwnd) std.debug.panic("the menu ({*}) didn't get the mouse capture for menu {t}, {?*} has it", .{ w.menu_hwnd, menu, capture });
+}
+
+/// Shows the note (bb.menuNote) below the menu, their right edges together, or hides it if
+/// the menu has none.
+fn syncNote(w: *Window) void {
+    if (bb.menuNote() == null) {
+        _ = win32.ShowWindow(w.note_hwnd, win32.SW_HIDE);
+        w.note_shown = false;
+        return;
+    }
+    var menu: win32.RECT = undefined;
+    if (0 == win32.GetWindowRect(w.menu_hwnd, &menu)) win32.panicWin32("GetWindowRect(menu)", win32.GetLastError());
+    // Laid out at our window's DPI, as the menu.
+    const dpi = win32.dpiFromHwnd(w.hwnd);
+    const note = bb.noteSize(dpi, TextMeasure{ .formats = w.textFormats(dpi) });
+    const anchor: win32.POINT = .{ .x = menu.right - note.w, .y = menu.bottom + scale(4, dpi) };
+    const size: win32.SIZE = .{ .cx = note.w, .cy = note.h };
+    var placed: win32.RECT = undefined;
+    if (0 == win32.CalculatePopupWindowPosition(&anchor, &size, @bitCast(win32.TPM_WORKAREA), null, &placed))
+        win32.panicWin32("CalculatePopupWindowPosition(note)", win32.GetLastError());
+    if (0 == win32.SetWindowPos(w.note_hwnd, null, placed.left, placed.top, note.w, note.h, .{ .SHOWWINDOW = 1, .NOACTIVATE = 1 }))
+        win32.panicWin32("SetWindowPos(note)", win32.GetLastError());
+    win32.invalidateHwnd(w.note_hwnd);
+    w.note_shown = true;
 }
 
 /// Stands in for the frame we don't draw: the resize edge (an HT* value) under `pt`, if any.
@@ -1220,22 +1328,43 @@ fn ask(w: *Window, c: bb.Confirm) bool {
     const t = bb.confirmText(c, &message_buf);
     var title_w: [256:0]u16 = undefined;
     var message_w: [1024:0]u16 = undefined;
-    title_w[std.unicode.utf8ToUtf16Le(&title_w, t.title) catch unreachable] = 0;
-    // A source's name is UTF-8 Windows gave us.
-    message_w[std.unicode.utf8ToUtf16Le(&message_w, t.message) catch unreachable] = 0;
+    // WTF-8, as a source's name is (what Windows gave us, unpaired surrogates and all).
+    title_w[std.unicode.wtf8ToWtf16Le(&title_w, t.title) catch unreachable] = 0;
+    message_w[std.unicode.wtf8ToWtf16Le(&message_w, t.message) catch unreachable] = 0;
     // The menu, if open, can't stay over the question.
     _ = bb.closeMenu();
     syncMenu(w);
     // MB_ICONWARNING is 0x30: zigwin32 has its two bits as ICONHAND and ICONQUESTION.
+    // Kept out of captures as our other windows are: the box's window is had as it activates.
+    const hook = win32.SetWindowsHookExW(win32.WH_CBT, excludeBoxFromCapture, null, win32.GetCurrentThreadId()) orelse
+        win32.panicWin32("SetWindowsHookEx", win32.GetLastError());
     const answer = win32.MessageBoxW(w.hwnd, &message_w, &title_w, .{ .YESNO = 1, .ICONHAND = 1, .ICONQUESTION = 1, .DEFBUTTON2 = 1 });
+    if (0 == win32.UnhookWindowsHookEx(hook)) win32.panicWin32("UnhookWindowsHookEx", win32.GetLastError());
     return answer == .YES;
+}
+
+/// ask's hook while its box is up: the box, as it activates, gets applyCaptureExclusion.
+fn excludeBoxFromCapture(code: i32, wparam: win32.WPARAM, lparam: win32.LPARAM) callconv(.winapi) win32.LRESULT {
+    if (code == win32.HCBT_ACTIVATE) applyCaptureExclusion(@ptrFromInt(wparam));
+    return win32.CallNextHookEx(null, code, wparam, lparam);
 }
 
 /// Applies bb's window state (quit, device lists, menu, captures, minimize, always on top,
 /// capture exclusion, collapsed) when it's changed, and repaints. Call after any bb input that changed something.
 fn syncWindow(w: *Window) void {
     if (bb.takeConfirm()) |c| if (ask(w, c)) bb.confirmed(c);
-    if (bb.quitRequested()) return w.quit();
+    if (bb.takeQuitRequest()) |q| switch (q) {
+        .quit => return w.quit(),
+        // Now, not waiting for the recording's files: they're left as a crash leaves them,
+        // which is how they're written to be left at any moment (`blackbox recover`
+        // finishes them). As a crash ends it, too: TerminateProcess, not ExitProcess
+        // (std.process.exit), which runs DLLs' detach code after killing the other threads,
+        // and that can wait forever on a lock one of them held (in Media Foundation, D3D).
+        .force_quit => {
+            _ = win32.TerminateProcess(win32.GetCurrentProcess(), 0);
+            win32.panicWin32("TerminateProcess", win32.GetLastError());
+        },
+    };
     const hwnd = w.hwnd;
     win32.invalidateHwnd(hwnd);
     // Before syncMenu: the list is the menu.
@@ -1261,6 +1390,7 @@ fn syncWindow(w: *Window) void {
         w.exclude_from_capture = exclude_from_capture;
         applyCaptureExclusion(hwnd);
         applyCaptureExclusion(w.menu_hwnd);
+        applyCaptureExclusion(w.note_hwnd);
         // Whether there's a warning about it changes the collapsed height.
         if (w.collapsed) {
             var rect: win32.RECT = undefined;
@@ -1381,10 +1511,11 @@ fn recordingElapsedMs(w: *const Window) ?u64 {
     return (record.qpc100ns() - r.start_qpc) / 10_000;
 }
 
-fn paint(w: *Window, comptime which: enum { main, menu }) void {
+fn paint(w: *Window, comptime which: enum { main, menu, note }) void {
     const hwnd = switch (which) {
         .main => w.hwnd,
         .menu => w.menu_hwnd,
+        .note => w.note_hwnd,
     };
     _, const ps = win32.beginPaint(hwnd);
     defer win32.endPaint(hwnd, &ps);
@@ -1403,6 +1534,7 @@ fn paint(w: *Window, comptime which: enum { main, menu }) void {
     const target_slot = switch (which) {
         .main => &w.main_target,
         .menu => &w.menu_target,
+        .note => &w.note_target,
     };
     const target: *Target = if (target_slot.*) |*t| t else blk: {
         target_slot.* = .init(gpu, hwnd);
@@ -1420,11 +1552,12 @@ fn paint(w: *Window, comptime which: enum { main, menu }) void {
             w.frame_clock.setAnimating(bb.animating());
         },
         .menu => bb.paintMenu(&painter, size.cx, dpi),
+        .note => bb.paintNote(&painter, size.cx, size.cy, dpi),
     }
     target.endFrame(gpu) catch |err| switch (err) {
         error.RecreateTarget => {
             // Every window's target belongs to the lost device.
-            for ([_]*?Target{ &w.main_target, &w.menu_target }) |slot| if (slot.*) |*t| {
+            for ([_]*?Target{ &w.main_target, &w.menu_target, &w.note_target }) |slot| if (slot.*) |*t| {
                 t.deinit();
                 slot.* = null;
             };
@@ -1432,6 +1565,7 @@ fn paint(w: *Window, comptime which: enum { main, menu }) void {
             w.gpu = null;
             win32.invalidateHwnd(w.hwnd);
             win32.invalidateHwnd(w.menu_hwnd);
+            win32.invalidateHwnd(w.note_hwnd);
         },
     };
 }

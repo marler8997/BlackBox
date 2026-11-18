@@ -572,13 +572,14 @@ pub const CaptureExclusion = union(enum) {
 };
 
 /// What Black Box is doing with recordings.
-const Mode = enum {
+const Mode = union(enum) {
     idle,
     /// The user wants to be recording: the platform records to match (see isRecording).
     recording,
     /// Quit was asked for while recording or while a recording's files were still being
-    /// finished: it closes once they are (see closeWhenFinished).
-    closing,
+    /// finished: it closes once they are (see closeWhenFinished). How much they have left,
+    /// once the platform has said (see setFinishingLeft).
+    closing: ?FinishingLeft,
 };
 
 const State = struct {
@@ -599,10 +600,10 @@ const State = struct {
     /// The button the left mouse button went down on, until it's released or the mouse moves
     /// off it, see onMouseUp.
     pressed: ?Hot = null,
-    /// Quit was chosen; the platform closes the window.
-    quit_requested: bool = false,
-    /// Something that ends recording, or a track, chosen while recording: the platform asks
-    /// the user first (see takeConfirm).
+    /// Quit or Force Quit was chosen, until the platform takes it (see takeQuitRequest): an
+    /// event, not a state. Closing, the state, is Mode's.
+    quit_requested: ?QuitRequest = null,
+    /// Removing a track while recording: the platform asks the user first (see takeConfirm).
     confirm_requested: ?Confirm = null,
     /// Minimize was clicked; the platform minimizes the window, see takeMinimize.
     minimize_requested: bool = false,
@@ -854,22 +855,122 @@ pub fn isDragArea(x: i32, y: i32) bool {
     return state.menu == null and hitTest(x, y) == .none;
 }
 
-pub fn quitRequested() bool {
+/// Quitting, once chosen.
+pub const QuitRequest = enum {
+    /// The platform closes the window, once any recording's files are finished (see
+    /// closeWhenFinished).
+    quit,
+    /// Force Quit (Quit, while closing): the platform ends now, without waiting for the files.
+    /// They're left as a crash leaves them: `blackbox recover` finishes them.
+    force_quit,
+};
+
+/// Quit or Force Quit, if one was chosen since the last call. Taken once: kept, every input
+/// after would quit again (closing the menu, skipping the rest of what it changed).
+pub fn takeQuitRequest() ?QuitRequest {
+    defer state.quit_requested = null;
     return state.quit_requested;
 }
 
-/// Quit (the menu's, or the platform's: Alt+F4, the taskbar's close). While recording, asked
-/// first: quitting stops it.
+/// How much finishing a recording's files has left: the journal it has yet to read, and if
+/// it can be told yet (from how fast that's going down), about how long.
+pub const FinishingLeft = struct { bytes: u64, seconds: ?u64 };
+
+/// While closing, the platform says how much finishing the files has left, now and then:
+/// shown in the top bar and Force Quit's note.
+pub fn setFinishingLeft(left: FinishingLeft) void {
+    std.debug.assert(state.mode == .closing);
+    state.mode = .{ .closing = left };
+}
+
+/// E.g. "12.4 MB left, about 9 seconds": fmtBytes's and fmtDuration's.
+fn fmtFinishingLeft(left: FinishingLeft) std.fmt.Alt(FinishingLeft, formatFinishingLeft) {
+    return .{ .data = left };
+}
+fn formatFinishingLeft(left: FinishingLeft, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    try w.print("{f} left", .{fmtBytes(left.bytes)});
+    if (left.seconds) |sec| try w.print(", about {f}", .{fmtDuration(sec)});
+}
+
+/// Room for any fmtFinishingLeft, whatever its u64s: at most "18446744.1 TB left, about
+/// 5,124,095,576,030,431 hours" (57 bytes), see its test.
+const finishing_left_max = 64;
+
+/// A long fmtFinishingLeft, for the note's width, so it doesn't change as the numbers go (one
+/// longer, from an absurd estimate, is clipped).
+const finishing_left_reserve = "999.9 MB left, about 9 hours 59 minutes";
+
+/// While the open menu needs more said than it has room for: a note for the platform to show
+/// in a popup of its own, beside the menu. The "⋯" menu while closing, about Force Quit.
+pub fn menuNote() ?Note {
+    const menu = state.menu orelse return null;
+    if (menu != .more) return null;
+    const finishing_left = switch (state.mode) {
+        .closing => |left| left,
+        .idle, .recording => return null,
+    };
+    var note: Note = .{};
+    if (finishing_left) |left| {
+        note.left_len = (std.fmt.bufPrint(&note.left_buf, "{f}", .{fmtFinishingLeft(left)}) catch unreachable).len;
+    }
+    return note;
+}
+
+/// Force Quit's note: how much is left (once known), then what Force Quit does.
+pub const Note = struct {
+    left_buf: [finishing_left_max]u8 = undefined,
+    left_len: usize = 0,
+
+    const lines = [_][]const u8{
+        "Black Box quits once the recording's",
+        "files are finished.",
+        "Force Quit quits now, leaving them",
+        "unfinished: blackbox recover finishes",
+        "them later.",
+    };
+
+    /// The lines, the first how much is left (empty until known).
+    fn line(n: *const Note, i: usize) []const u8 {
+        return if (i == 0) n.left_buf[0..n.left_len] else lines[i - 1];
+    }
+    const count = lines.len + 1;
+};
+
+/// The note's size (see menuNote), at our window's DPI, room kept for how much is left at
+/// its longest. `measure` as for menuRect.
+pub fn noteSize(dpi: u32, measure: anytype) struct { w: i32, h: i32 } {
+    const s: Scale = .{ .dpi = dpi };
+    var w: i32 = measure.width(finishing_left_reserve, .normal);
+    for (Note.lines) |text| w = @max(w, measure.width(text, .normal));
+    return .{
+        .w = w + 2 * s.px(note_pad_px),
+        .h = @as(i32, Note.count) * s.px(note_line_px) + 2 * s.px(note_pad_px),
+    };
+}
+
+/// Paints the note (see menuNote) into its popup.
+pub fn paintNote(p: anytype, width: i32, height: i32, dpi: u32) void {
+    const s: Scale = .{ .dpi = dpi };
+    p.clear(color.menu);
+    const note = menuNote() orelse return;
+    const pad = s.px(note_pad_px);
+    for (0..Note.count) |i| {
+        const top = pad + @as(i32, @intCast(i)) * s.px(note_line_px);
+        p.text(note.line(i), .{ .left = pad, .top = top, .right = width - pad, .bottom = @min(height, top + s.px(note_line_px)) }, .normal, color.text, .left);
+    }
+}
+
+const note_pad_px = 12;
+const note_line_px = 20;
+
+/// Quit (the menu's, or the platform's: Alt+F4, the taskbar's close). While recording, it stops,
+/// and the window closes once its files are finished (see closeWhenFinished, and Force Quit).
 pub fn requestQuit() void {
-    if (state.mode == .recording) {
-        state.confirm_requested = .quit;
-    } else state.quit_requested = true;
+    state.quit_requested = .quit;
 }
 
 /// What the user is asked before it's done, see takeConfirm.
 pub const Confirm = union(enum) {
-    /// Quitting while recording: it stops.
-    quit,
     /// Removing this source while recording: its track ends.
     remove: u32,
 };
@@ -885,10 +986,6 @@ pub fn takeConfirm() ?Confirm {
 /// names a source.
 pub fn confirmText(c: Confirm, buf: []u8) struct { title: []const u8, message: []const u8 } {
     return switch (c) {
-        .quit => .{
-            .title = "Stop recording and quit?",
-            .message = "The recording stops, and its files are finished before Black Box closes.",
-        },
         .remove => |id| .{
             .title = "Remove this track while recording?",
             .message = if (findSource(id)) |src| std.fmt.bufPrint(buf, "{s} stops being recorded now. Added back, it carries on in the same file.", .{src.name()}) catch
@@ -900,7 +997,6 @@ pub fn confirmText(c: Confirm, buf: []u8) struct { title: []const u8, message: [
 /// The user said yes: it's done (if it still can be: the source may be gone by now).
 pub fn confirmed(c: Confirm) void {
     switch (c) {
-        .quit => state.quit_requested = true,
         .remove => |id| if (findSource(id) != null) removeSource(id),
     }
 }
@@ -1135,7 +1231,8 @@ fn menuRow(menu: Menu, i: usize) MenuRow {
             const item = std.enums.values(MoreItem)[i];
             return .{
                 .item = .{ .more = item },
-                .text = .{ .static = item.title() },
+                // Already quitting, waiting for the files: quitting now (see menuNote).
+                .text = .{ .static = if (item == .quit and state.mode == .closing) "Force Quit" else item.title() },
                 .checked = item == .exclude_from_capture and state.settings.exclude_from_capture,
                 .divider_below = item == .exclude_from_capture,
             };
@@ -1258,10 +1355,11 @@ pub fn onMenuMouseUp(x: i32, y: i32) bool {
     if (!std.meta.eql(pressed, @as(?MenuItem, item))) return false;
     const menu = state.menu.?;
     switch (item) {
-        // TODO: confirm when that would stop a recording.
         .more => |more| switch (more) {
             .exclude_from_capture => state.settings.exclude_from_capture = !state.settings.exclude_from_capture,
-            .quit => requestQuit(),
+            .quit => if (state.mode == .closing) {
+                state.quit_requested = .force_quit;
+            } else requestQuit(),
         },
         .track => |track| switch (track) {
             // Those that happened while the menu was open stay.
@@ -1338,7 +1436,8 @@ pub fn isRecording() bool {
 /// recording stops, nothing new can start, and the top bar says the window closes once the
 /// files are done (the platform closes it then, if it's still closing: see recordingProblem).
 pub fn closeWhenFinished() void {
-    state.mode = .closing;
+    // Again (the window closed again, while closing): how much is left stays.
+    if (state.mode != .closing) state.mode = .{ .closing = null };
 }
 
 pub fn isClosing() bool {
@@ -1425,12 +1524,16 @@ pub fn paint(p: anytype, width: i32, height: i32, dpi: u32) void {
         paintToggle(p, state.minimize_button, .minimize, false, look(.minimize_button));
 
         const status_r = line(state.button.right + s.px(12), state.minimize_button.left - s.px(8), top, bar_h);
-        if (state.mode == .closing) {
-            p.text(closing_text, status_r, .small, color.text, .left);
-        } else if (state.recording_error) |*m| {
-            p.text(m.slice(), status_r, .small, color.amber, .left);
-        } else {
-            paintStatus(p, s, status_r);
+        switch (state.mode) {
+            .closing => |finishing| if (finishing) |known| {
+                var buf: [closing_text_prefix.len + finishing_left_max]u8 = undefined;
+                p.text(std.fmt.bufPrint(&buf, closing_text_prefix ++ "{f}", .{fmtFinishingLeft(known)}) catch unreachable, status_r, .small, color.text, .left);
+            } else p.text(closing_text, status_r, .small, color.text, .left),
+            .idle, .recording => if (state.recording_error) |*m| {
+                p.text(m.slice(), status_r, .small, color.amber, .left);
+            } else {
+                paintStatus(p, s, status_r);
+            },
         }
     }
     top += bar_h + gap;
@@ -1473,7 +1576,9 @@ fn captureWarning(buf: []u8) ?[]const u8 {
     };
 }
 
-const closing_text = "Finishing the recording\u{2026} Black Box closes when it's done";
+const closing_text = closing_text_prefix ++ "Black Box closes when it's done";
+/// Once how much is left is known (see setFinishingLeft), followed by that.
+const closing_text_prefix = "Finishing the recording\u{2026} ";
 
 /// The recording time the disk has room for (an estimate, see averageRate), then faintly,
 /// what it's from: free space and the rate.
@@ -2434,30 +2539,26 @@ test "a track's rows depend on its kind, never its state" {
     }
 }
 
-test "quitting, or removing a track, while recording is asked first" {
+test "quitting while recording isn't asked, removing a track is" {
     init(std.testing.allocator);
     defer deinit();
     var p: TestPainter = .{};
     // Not recording: Quit quits.
     requestQuit();
-    try std.testing.expect(quitRequested());
+    try std.testing.expectEqual(QuitRequest.quit, takeQuitRequest());
     try std.testing.expectEqual(null, takeConfirm());
-    state.quit_requested = false;
+    state.quit_requested = null;
 
     addSource(.microphone, try testDevice("Mic", .microphone));
     const id = sources()[0].id;
     testPaint(&p);
     testClick(state.button);
     try std.testing.expect(isRecording());
-    // Recording: asked, once; yes quits.
+    // Recording: Quit quits too (the recording stops, its files are finished), not asked.
     requestQuit();
-    try std.testing.expect(!quitRequested());
-    const quit = takeConfirm().?;
-    try std.testing.expectEqual(Confirm.quit, quit);
+    try std.testing.expectEqual(QuitRequest.quit, takeQuitRequest());
     try std.testing.expectEqual(null, takeConfirm());
-    confirmed(quit);
-    try std.testing.expect(quitRequested());
-    state.quit_requested = false;
+    state.quit_requested = null;
 
     // Its track's Remove: asked, naming it; no (not confirmed) keeps it, yes removes it.
     testPaint(&p);
@@ -2589,6 +2690,53 @@ test "quitting while recording stops it, and says the window closes once it's fi
     try std.testing.expect(p.find(closing_text) == null);
 }
 
+test "while closing, Quit is Force Quit, with a note saying what's left and what it does" {
+    init(std.testing.allocator);
+    defer deinit();
+    var p: TestPainter = .{};
+    addSource(.microphone, try testDevice("Mic", .microphone));
+    testPaint(&p);
+    testClick(state.button);
+    closeWhenFinished();
+    testPaint(&p);
+    try p.expectText(closing_text);
+    testClick(state.more_button);
+    testPaintMenu(&p);
+    try p.expectText("Force Quit");
+    // Its note, before how much is left is known: just what Force Quit does.
+    const note = menuNote().?;
+    try std.testing.expectEqualStrings("", note.line(0));
+    try std.testing.expectEqualStrings("Force Quit quits now, leaving them", note.line(3));
+    // Then how much, in the note and the top bar.
+    setFinishingLeft(.{ .bytes = 12_400_000, .seconds = 9 });
+    try std.testing.expectEqualStrings("12.4 MB left, about 9 seconds", menuNote().?.line(0));
+    testPaint(&p);
+    try p.expectText("Finishing the recording\u{2026} 12.4 MB left, about 9 seconds");
+    // Closing again (the window closed again) keeps it.
+    closeWhenFinished();
+    try std.testing.expectEqualStrings("12.4 MB left, about 9 seconds", menuNote().?.line(0));
+    // Chosen: quit now.
+    try std.testing.expectEqual(null, takeQuitRequest());
+    try std.testing.expect(testClickMenuRow(1));
+    try std.testing.expectEqual(QuitRequest.force_quit, takeQuitRequest());
+    // Not closing, it's Quit again, and no note.
+    state.mode = .idle;
+    testClick(state.more_button);
+    testPaintMenu(&p);
+    try p.expectText("Quit");
+    try std.testing.expectEqual(null, menuNote());
+}
+
+test fmtFinishingLeft {
+    try std.testing.expectFmt("640.0 KB left", "{f}", .{fmtFinishingLeft(.{ .bytes = 640_000, .seconds = null })});
+    try std.testing.expectFmt("12.4 MB left, about 1 second", "{f}", .{fmtFinishingLeft(.{ .bytes = 12_400_000, .seconds = 1 })});
+    try std.testing.expectFmt("3.2 GB left, about 2 minutes", "{f}", .{fmtFinishingLeft(.{ .bytes = 3_200_000_000, .seconds = 150 })});
+    // The longest there is fits the room kept for any.
+    var buf: [finishing_left_max]u8 = undefined;
+    const longest = try std.fmt.bufPrint(&buf, "{f}", .{fmtFinishingLeft(.{ .bytes = std.math.maxInt(u64), .seconds = std.math.maxInt(u64) })});
+    try std.testing.expectEqualStrings("18446744.1 TB left, about 5,124,095,576,030,431 hours", longest);
+}
+
 test "the more menu's Quit" {
     init(std.testing.allocator);
     defer deinit();
@@ -2596,9 +2744,11 @@ test "the more menu's Quit" {
     testPaint(&p);
     testClick(state.more_button);
     testPaintMenu(&p);
-    try std.testing.expect(!quitRequested());
+    try std.testing.expectEqual(null, takeQuitRequest());
     try std.testing.expect(testClickMenuRow(1));
-    try std.testing.expect(quitRequested());
+    try std.testing.expectEqual(QuitRequest.quit, takeQuitRequest());
+    // Taken once: the inputs after don't quit again (closing the menu each time).
+    try std.testing.expectEqual(null, takeQuitRequest());
 }
 
 test "the status: how long the disk lasts at the tracks' rate" {
