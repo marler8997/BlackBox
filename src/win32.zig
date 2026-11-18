@@ -812,7 +812,9 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         // Alt+F4, the taskbar's close. Not DefWindowProc, which would destroy the window:
         // main does that.
         win32.WM_CLOSE => {
-            w.quit();
+            // As the menu's Quit: asked first while recording.
+            bb.requestQuit();
+            syncWindow(w);
             return 0;
         },
         else => return win32.DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -1211,9 +1213,28 @@ fn resizeEdge(w: *const Window, pt: win32.POINT) ?u32 {
     return null;
 }
 
+/// Asks the user bb's question (see bb.takeConfirm): yes or no, no by default. Returns
+/// whether it's yes.
+fn ask(w: *Window, c: bb.Confirm) bool {
+    var message_buf: [512]u8 = undefined;
+    const t = bb.confirmText(c, &message_buf);
+    var title_w: [256:0]u16 = undefined;
+    var message_w: [1024:0]u16 = undefined;
+    title_w[std.unicode.utf8ToUtf16Le(&title_w, t.title) catch unreachable] = 0;
+    // A source's name is UTF-8 Windows gave us.
+    message_w[std.unicode.utf8ToUtf16Le(&message_w, t.message) catch unreachable] = 0;
+    // The menu, if open, can't stay over the question.
+    _ = bb.closeMenu();
+    syncMenu(w);
+    // MB_ICONWARNING is 0x30: zigwin32 has its two bits as ICONHAND and ICONQUESTION.
+    const answer = win32.MessageBoxW(w.hwnd, &message_w, &title_w, .{ .YESNO = 1, .ICONHAND = 1, .ICONQUESTION = 1, .DEFBUTTON2 = 1 });
+    return answer == .YES;
+}
+
 /// Applies bb's window state (quit, device lists, menu, captures, minimize, always on top,
 /// capture exclusion, collapsed) when it's changed, and repaints. Call after any bb input that changed something.
 fn syncWindow(w: *Window) void {
+    if (bb.takeConfirm()) |c| if (ask(w, c)) bb.confirmed(c);
     if (bb.quitRequested()) return w.quit();
     const hwnd = w.hwnd;
     win32.invalidateHwnd(hwnd);

@@ -601,6 +601,9 @@ const State = struct {
     pressed: ?Hot = null,
     /// Quit was chosen; the platform closes the window.
     quit_requested: bool = false,
+    /// Something that ends recording, or a track, chosen while recording: the platform asks
+    /// the user first (see takeConfirm).
+    confirm_requested: ?Confirm = null,
     /// Minimize was clicked; the platform minimizes the window, see takeMinimize.
     minimize_requested: bool = false,
     /// Where things were last painted, for hit testing.
@@ -853,6 +856,53 @@ pub fn isDragArea(x: i32, y: i32) bool {
 
 pub fn quitRequested() bool {
     return state.quit_requested;
+}
+
+/// Quit (the menu's, or the platform's: Alt+F4, the taskbar's close). While recording, asked
+/// first: quitting stops it.
+pub fn requestQuit() void {
+    if (state.mode == .recording) {
+        state.confirm_requested = .quit;
+    } else state.quit_requested = true;
+}
+
+/// What the user is asked before it's done, see takeConfirm.
+pub const Confirm = union(enum) {
+    /// Quitting while recording: it stops.
+    quit,
+    /// Removing this source while recording: its track ends.
+    remove: u32,
+};
+
+/// A question for the user, if something asks one: the platform asks it (yes or no, no by
+/// default), then calls confirmed if the answer's yes.
+pub fn takeConfirm() ?Confirm {
+    defer state.confirm_requested = null;
+    return state.confirm_requested;
+}
+
+/// The question's words: a title, and what happens on yes. `buf` holds the message when it
+/// names a source.
+pub fn confirmText(c: Confirm, buf: []u8) struct { title: []const u8, message: []const u8 } {
+    return switch (c) {
+        .quit => .{
+            .title = "Stop recording and quit?",
+            .message = "The recording stops, and its files are finished before Black Box closes.",
+        },
+        .remove => |id| .{
+            .title = "Remove this track while recording?",
+            .message = if (findSource(id)) |src| std.fmt.bufPrint(buf, "{s} stops being recorded now. Added back, it carries on in the same file.", .{src.name()}) catch
+                "It stops being recorded now. Added back, it carries on in the same file." else "It's already gone.",
+        },
+    };
+}
+
+/// The user said yes: it's done (if it still can be: the source may be gone by now).
+pub fn confirmed(c: Confirm) void {
+    switch (c) {
+        .quit => state.quit_requested = true,
+        .remove => |id| if (findSource(id) != null) removeSource(id),
+    }
 }
 
 /// Whether Minimize was clicked since the last call.
@@ -1211,13 +1261,15 @@ pub fn onMenuMouseUp(x: i32, y: i32) bool {
         // TODO: confirm when that would stop a recording.
         .more => |more| switch (more) {
             .exclude_from_capture => state.settings.exclude_from_capture = !state.settings.exclude_from_capture,
-            .quit => state.quit_requested = true,
+            .quit => requestQuit(),
         },
-        // TODO: what removing a source does to a recording in progress.
         .track => |track| switch (track) {
             // Those that happened while the menu was open stay.
             .clear_clips => findSource(menu.track).?.clips_cleared += state.track_menu_clips,
-            .remove => removeSource(menu.track),
+            // While recording, its track ends: asked first.
+            .remove => if (state.mode == .recording) {
+                state.confirm_requested = .{ .remove = menu.track };
+            } else removeSource(menu.track),
         },
         // Taken from the list, closeMenu frees the rest.
         .device => |i| addSource(menu.devices, state.devices.swapRemove(i)),
@@ -2380,6 +2432,46 @@ test "a track's rows depend on its kind, never its state" {
             try std.testing.expectEqualSlices(TrackRow, want, trackRows(&src, &buf));
         };
     }
+}
+
+test "quitting, or removing a track, while recording is asked first" {
+    init(std.testing.allocator);
+    defer deinit();
+    var p: TestPainter = .{};
+    // Not recording: Quit quits.
+    requestQuit();
+    try std.testing.expect(quitRequested());
+    try std.testing.expectEqual(null, takeConfirm());
+    state.quit_requested = false;
+
+    addSource(.microphone, try testDevice("Mic", .microphone));
+    const id = sources()[0].id;
+    testPaint(&p);
+    testClick(state.button);
+    try std.testing.expect(isRecording());
+    // Recording: asked, once; yes quits.
+    requestQuit();
+    try std.testing.expect(!quitRequested());
+    const quit = takeConfirm().?;
+    try std.testing.expectEqual(Confirm.quit, quit);
+    try std.testing.expectEqual(null, takeConfirm());
+    confirmed(quit);
+    try std.testing.expect(quitRequested());
+    state.quit_requested = false;
+
+    // Its track's Remove: asked, naming it; no (not confirmed) keeps it, yes removes it.
+    testPaint(&p);
+    testClick(findSource(id).?.track_button);
+    testPaintMenu(&p);
+    var buf: [std.enums.values(TrackRow).len]TrackRow = undefined;
+    try std.testing.expect(testClickMenuRow(trackRows(findSource(id).?, &buf).len - 1));
+    const remove = takeConfirm().?;
+    try std.testing.expectEqual(Confirm{ .remove = id }, remove);
+    var text_buf: [256]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, confirmText(remove, &text_buf).message, "Mic stops being recorded now."));
+    try std.testing.expectEqual(1, sources().len);
+    confirmed(remove);
+    try std.testing.expectEqual(0, sources().len);
 }
 
 test "a track's menu clears the clips it showed, and removes the track" {
