@@ -232,7 +232,10 @@ const Window = struct {
     /// While a devices menu is open: its devices' live levels, see syncMenu.
     meters: ?*wasapi.DeviceMeters = null,
     /// A capture per bb source being captured, see syncCaptures. Their threads post to us.
-    captures: std.ArrayList(*wasapi.Capture) = .empty,
+    captures: std.ArrayList(Capture) = .empty,
+    /// Webcams whose sources were removed, stopping without holding up the window: see
+    /// Removing.
+    removing: std.ArrayList(Removing) = .empty,
     frame_clock: FrameClock = undefined,
     /// While recording, see syncRecording.
     recording: ?*record.Recording = null,
@@ -294,8 +297,11 @@ const Window = struct {
         if (w.recording != null) stopRecording(w);
         for (w.finishing.items) |r| r.destroy(checkRecordingLeaks);
         w.finishing.deinit(global.gpa);
-        for (w.captures.items) |c| c.destroy(global.gpa);
+        for (w.captures.items) |c| c.destroy();
         w.captures.deinit(global.gpa);
+        // Their tracks ended with the recording (stopRecording): now they just stop.
+        for (w.removing.items) |rm| rm.capture.destroy(global.gpa);
+        w.removing.deinit(global.gpa);
         if (w.icon_big) |i| destroyIcon(i);
         if (w.icon_small) |i| destroyIcon(i);
         if (w.text_formats) |*t| t.deinit();
@@ -316,12 +322,21 @@ const Window = struct {
         return &w.text_formats.?;
     }
 
-    /// Closes any menu and ends the message loop; main then destroys the window.
+    /// Closes any menu and ends the message loop; main then destroys the window. While
+    /// recording, or while a recording's files are still being finished, it waits: recording
+    /// stops, the window says it's finishing (bb.closeWhenFinished), and the loop ends when the
+    /// last files are done (record.finished_msg).
     fn quit(w: *Window) void {
         // So the menu popup, destroyed with us, has nothing left to do when it loses the
         // mouse capture.
         _ = bb.closeMenu();
         syncMenu(w);
+        if (w.recording != null or w.finishing.items.len > 0) {
+            bb.closeWhenFinished();
+            syncRecording(w);
+            win32.invalidateHwnd(w.hwnd);
+            return;
+        }
         win32.PostQuitMessage(0);
     }
 };
@@ -332,6 +347,9 @@ const max_text = 512;
 const window_class_name = win32.L("BlackBoxMainWindow");
 const menu_class_name = win32.L("BlackBoxMenu");
 const disk_timer_id = 1;
+/// While webcams are being removed: see removingTick.
+const removing_timer_id = 2;
+const removing_check_ms = 20;
 /// How often free disk space is checked.
 const disk_refresh_ms = 1000;
 
@@ -633,10 +651,13 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         },
         win32.WM_TIMER => {
             switch (wparam) {
-                disk_timer_id => refreshDisk(),
+                disk_timer_id => {
+                    refreshDisk();
+                    win32.invalidateHwnd(hwnd);
+                },
+                removing_timer_id => removingTick(w),
                 else => unreachable,
             }
-            win32.invalidateHwnd(hwnd);
             return 0;
         },
         frame_msg => {
@@ -648,7 +669,7 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
                 win32.invalidateHwnd(hwnd);
                 if (0 == win32.UpdateWindow(hwnd)) win32.panicWin32("UpdateWindow", win32.GetLastError());
             }
-            if (bb.menuAnimating()) {
+            if (bb.menuAnimating() and bb.menuChanged()) {
                 win32.invalidateHwnd(w.menu_hwnd);
                 if (0 == win32.UpdateWindow(w.menu_hwnd)) win32.panicWin32("UpdateWindow(menu)", win32.GetLastError());
             }
@@ -657,10 +678,18 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         wasapi.status_msg => {
             const id: u32 = @intCast(wparam);
             // Gone if its source was removed after it posted.
-            for (w.captures.items) |c| if (c.id == id) {
-                bb.setSourceStatus(id, c.sourceStatus());
-                // Live after recording started (added during it, or slow to start).
-                if (w.recording != null and c.status.load(.acquire) == .live) startTrack(w, c);
+            for (w.captures.items) |c| if (c.id() == id) {
+                const status = c.sourceStatus();
+                bb.setSourceStatus(id, status);
+                if (w.recording != null) switch (status) {
+                    // Live after recording started (added during it, or slow to start).
+                    .live => startTrack(w, c),
+                    // Failed while recording: its track ends now, all it captured in its
+                    // file, rather than staying open (a webcam's last fragment unwritten would
+                    // keep the journal from being freed after it).
+                    .failed => stopTrack(c),
+                    .starting => {},
+                };
                 win32.invalidateHwnd(hwnd);
             };
             return 0;
@@ -689,6 +718,8 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
             for (w.finishing.items, 0..) |f, i| if (f == r) {
                 _ = w.finishing.swapRemove(i);
                 r.destroy(checkRecordingLeaks);
+                // Quitting waited for this (see Window.quit).
+                if (bb.isClosing() and w.finishing.items.len == 0) win32.PostQuitMessage(0);
                 return 0;
             };
             unreachable;
@@ -853,34 +884,158 @@ fn startRecording(w: *Window) void {
     };
     // Those not live yet start when they are, see wasapi.status_msg.
     for (w.captures.items) |c| {
-        if (c.status.load(.acquire) == .live) startTrack(w, c);
+        if (c.isLive()) startTrack(w, c);
     }
 }
 
+/// A source's capture: audio (WASAPI) or a webcam (Media Foundation). Both post
+/// wasapi.status_msg and give a recorder what they capture.
+const Capture = union(enum) {
+    audio: *wasapi.Capture,
+    video: *webcam.Capture,
+
+    fn id(c: Capture) u32 {
+        return switch (c) {
+            inline else => |x| x.id,
+        };
+    }
+    fn isLive(c: Capture) bool {
+        return switch (c) {
+            .audio => |a| a.status.load(.acquire) == .live,
+            .video => |v| v.isLive(),
+        };
+    }
+    fn sourceStatus(c: Capture) bb.SourceStatus {
+        return switch (c) {
+            inline else => |x| x.sourceStatus(),
+        };
+    }
+    /// The window thread's to read, see attachRecorder.
+    fn recorder(c: Capture) ?*record.AudioPoolSource {
+        return switch (c) {
+            .audio => |a| a.recorder,
+            .video => |v| v.recorderSource(),
+        };
+    }
+    fn detachRecorder(c: Capture) ?*record.AudioPoolSource {
+        return switch (c) {
+            inline else => |x| x.detachRecorder(),
+        };
+    }
+    fn destroy(c: Capture) void {
+        switch (c) {
+            inline else => |x| x.destroy(global.gpa),
+        }
+    }
+};
+
 /// Records a live capture's source, once per recording.
-fn startTrack(w: *Window, c: *wasapi.Capture) void {
+fn startTrack(w: *Window, c: Capture) void {
     const r = w.recording.?;
-    if (c.recorder != null) return;
+    if (c.recorder() != null) return;
     const src = for (bb.sources()) |*src| {
-        if (src.id == c.id) break src;
+        if (src.id == c.id()) break src;
     } else return; // removed
-    const tw = r.addTrack(c.id, .{
-        .input = c.input,
+    const media: record.TrackInfo.Media = switch (c) {
+        .audio => |a| .{ .audio = .{
+            .input = a.input,
+            .device_format = if (src.device) |d| d.format else null,
+            .raw = a.raw,
+        } },
+        // Failed since it was seen live: no track.
+        .video => |v| .{ .video = v.trackVideo() orelse return },
+    };
+    const tw = r.addTrack(c.id(), .{
+        .media = media,
         .device_id = if (src.device) |d| d.id else "",
         .device_name = src.name(),
-        .device_format = if (src.device) |d| d.format else null,
-        .raw = c.raw,
+        .novideo = switch (c) {
+            .audio => &.{},
+            .video => |v| v.noVideo(),
+        },
     }) orelse return;
-    c.attachRecorder(tw);
+    switch (c) {
+        .audio => |a| a.attachRecorder(tw),
+        .video => |v| v.attachRecorder(tw, r.start_qpc),
+    }
 }
 
-fn stopTrack(c: *wasapi.Capture) void {
-    if (c.detachRecorder()) |tw| tw.close();
+/// Stops recording a capture's track (see requestStop and finishStop).
+fn stopTrack(c: Capture) void {
+    requestStop(c);
+    finishStop(c, webcam.Capture.drainDeadline(), .gone);
+}
+
+/// A webcam's encoder is drained into its track before it stops, so the frames it holds reach
+/// the file: this asks for it. Stopping several, ask them all first, so they drain at once.
+fn requestStop(c: Capture) void {
+    switch (c) {
+        .audio => {},
+        .video => |v| v.requestDrain(),
+    }
+}
+
+/// After requestStop: waits for a webcam's drain (until `deadline`, one for all the webcams
+/// stopping), then the track ends, saying why (see record.AudioPoolSource.close).
+fn finishStop(c: Capture, deadline: u64, why: record.AudioPoolSource.CloseReason) void {
+    switch (c) {
+        .audio => {},
+        .video => |v| v.waitDrained(deadline),
+    }
+    if (c.detachRecorder()) |tw| tw.close(why);
+}
+
+/// A webcam whose source was removed. Its encoder drains into its track (requestStop), then
+/// its track ends (finishStop) and its thread is asked to stop, then it's destroyed once the
+/// thread has ended (closing the camera takes a few hundred milliseconds): each step when
+/// it's ready, checked on a timer (removingTick), so the window isn't held up meanwhile.
+const Removing = struct {
+    capture: *webcam.Capture,
+    /// For the drain, see Capture.waitDrained.
+    deadline: u64,
+    /// Its track ended and its thread asked to stop.
+    stopping: bool = false,
+
+    /// Its track ends now, the drain done or not (past `deadline`), and its thread stops.
+    fn finish(rm: *Removing, deadline: u64) void {
+        finishStop(.{ .video = rm.capture }, deadline, .gone);
+        rm.capture.requestStop();
+        rm.stopping = true;
+    }
+};
+
+fn startRemoving(w: *Window, c: *webcam.Capture) void {
+    requestStop(.{ .video = c });
+    w.removing.append(global.gpa, .{ .capture = c, .deadline = webcam.Capture.drainDeadline() }) catch @panic("out of memory");
+    if (0 == win32.SetTimer(w.hwnd, removing_timer_id, removing_check_ms, null)) win32.panicWin32("SetTimer(removing)", win32.GetLastError());
+}
+
+/// Moves each removed webcam on a step, if it's ready to (see Removing).
+fn removingTick(w: *Window) void {
+    const now = record.qpc100ns();
+    var i: usize = 0;
+    while (i < w.removing.items.len) {
+        const rm = &w.removing.items[i];
+        if (!rm.stopping and (rm.capture.drainDone() or now >= rm.deadline)) rm.finish(now);
+        if (rm.stopping and rm.capture.hasExited()) {
+            rm.capture.destroy(global.gpa);
+            _ = w.removing.swapRemove(i);
+        } else {
+            i += 1;
+        }
+    }
+    if (w.removing.items.len == 0 and 0 == win32.KillTimer(w.hwnd, removing_timer_id))
+        win32.panicWin32("KillTimer(removing)", win32.GetLastError());
 }
 
 fn stopRecording(w: *Window) void {
     const r = w.recording.?;
-    for (w.captures.items) |c| stopTrack(c);
+    for (w.captures.items) |c| requestStop(c);
+    const deadline = webcam.Capture.drainDeadline();
+    // Still going: their tracks end with the recording.
+    for (w.captures.items) |c| finishStop(c, deadline, .recording_end);
+    // Removed webcams still draining into this recording's tracks: those end now too.
+    for (w.removing.items) |*rm| if (!rm.stopping) rm.finish(@max(deadline, rm.deadline));
     r.stop();
     w.finishing.append(global.gpa, r) catch @panic("out of memory");
     w.recording = null;
@@ -897,13 +1052,19 @@ fn syncCaptures(w: *Window) void {
     while (i < w.captures.items.len) {
         const c = w.captures.items[i];
         const exists = for (bb.sources()) |s| {
-            if (s.id == c.id) break true;
+            if (s.id == c.id()) break true;
         } else false;
         if (exists) {
             i += 1;
         } else {
-            stopTrack(c);
-            c.destroy(global.gpa);
+            switch (c) {
+                .audio => {
+                    stopTrack(c);
+                    c.destroy();
+                },
+                // Drains and stops without holding up the window.
+                .video => |v| startRemoving(w, v),
+            }
             _ = w.captures.swapRemove(i);
         }
     }
@@ -911,18 +1072,24 @@ fn syncCaptures(w: *Window) void {
     // isn't retried until its source is removed and added again.
     for (bb.sources()) |s| {
         const has_capture = for (w.captures.items) |c| {
-            if (c.id == s.id) break true;
+            if (c.id() == s.id) break true;
         } else false;
         if (has_capture) continue;
+        w.captures.ensureUnusedCapacity(global.gpa, 1) catch @panic("out of memory");
         switch (s.kind) {
             .microphone, .system_audio => {
-                w.captures.ensureUnusedCapacity(global.gpa, 1) catch @panic("out of memory");
                 const endpoint: wasapi.Endpoint = if (s.kind == .microphone) .microphone else .output;
                 const c = wasapi.Capture.create(global.gpa, s.id, endpoint, s.device.?.id, w.hwnd);
-                w.captures.appendAssumeCapacity(c);
+                w.captures.appendAssumeCapacity(.{ .audio = c });
                 bb.setSourceMeter(s.id, &c.meter);
             },
-            .screen, .webcam => unreachable, // can't be added yet, see bb.SourceKind.todo
+            .webcam => {
+                const c = webcam.Capture.create(global.gpa, s.id, s.device.?.id, w.hwnd);
+                w.captures.appendAssumeCapacity(.{ .video = c });
+                // The capture outlives the source (it's removed after, see Removing).
+                bb.setSourceVideoCounts(s.id, &c.counts);
+            },
+            .screen => unreachable, // can't be added yet, see bb.SourceKind.todo
         }
     }
 }
@@ -977,6 +1144,7 @@ fn syncMenu(w: *Window) void {
         _ = win32.ShowWindow(w.menu_hwnd, win32.SW_HIDE);
         // After hiding, so a slow device can't hold the menu on screen.
         stopMeters(w);
+        w.frame_clock.setAnimating(bb.animating());
         return;
     };
     if (w.menu_shown) |shown| if (std.meta.eql(shown, menu)) return;
@@ -986,14 +1154,18 @@ fn syncMenu(w: *Window) void {
     // Live levels while choosing a device (see DeviceMeters for what metering a microphone
     // involves).
     if (menu == .devices) {
-        const endpoint: wasapi.Endpoint = switch (menu.devices) {
+        const endpoint: ?wasapi.Endpoint = switch (menu.devices) {
             .microphone => .microphone,
             .system_audio => .output,
-            .screen, .webcam => unreachable, // no devices yet, see bb.SourceKind.hasDevice
+            // No levels to show.
+            .webcam => null,
+            .screen => unreachable, // no devices yet, see bb.SourceKind.hasDevice
         };
-        const m = wasapi.DeviceMeters.start(global.gpa, endpoint, bb.listedDevices());
-        w.meters = m;
-        bb.setDeviceLevels(m.levels);
+        if (endpoint) |e| {
+            const m = wasapi.DeviceMeters.start(global.gpa, e, bb.listedDevices());
+            w.meters = m;
+            bb.setDeviceLevels(m.levels);
+        }
     }
 
     // Laid out at our window's DPI, see paint.
@@ -1009,6 +1181,8 @@ fn syncMenu(w: *Window) void {
     if (0 == win32.SetWindowPos(w.menu_hwnd, null, placed.left, placed.top, size.cx, size.cy, .{ .SHOWWINDOW = 1, .NOACTIVATE = 1 }))
         win32.panicWin32("SetWindowPos(menu)", win32.GetLastError());
     win32.invalidateHwnd(w.menu_hwnd);
+    // Frames for what it shows live (levels, a webcam's counts), see bb.menuAnimating.
+    w.frame_clock.setAnimating(bb.animating());
     // Only if it doesn't have it already, from a menu it showed before this one (picking a
     // device after Add): setting it again, while we're in the background at least, loses it.
     if (win32.GetCapture() == w.menu_hwnd) return;
@@ -1047,7 +1221,8 @@ fn syncWindow(w: *Window) void {
     if (bb.takeDeviceListRequest()) |kind| switch (kind) {
         .microphone => wasapi.listDevices(global.gpa, .microphone),
         .system_audio => wasapi.listDevices(global.gpa, .output),
-        .screen, .webcam => unreachable, // no devices yet, see bb.SourceKind.hasDevice
+        .webcam => webcam.listDevices(global.gpa),
+        .screen => unreachable, // no devices yet, see bb.SourceKind.hasDevice
     };
     syncMenu(w);
     syncCaptures(w);
@@ -1193,7 +1368,7 @@ fn paint(w: *Window, comptime which: enum { main, menu }) void {
     _, const ps = win32.beginPaint(hwnd);
     defer win32.endPaint(hwnd, &ps);
     // Debug info. A capture's recorder is the window thread's to read, see attachRecorder.
-    for (w.captures.items) |c| bb.setSourceBuffer(c.id, if (c.recorder) |tw| tw.buffer() else null);
+    for (w.captures.items) |c| bb.setSourceBuffer(c.id(), if (c.recorder()) |tw| tw.buffer() else null);
 
     const size = win32.getClientSize(hwnd);
     // The menu is laid out at our window's DPI (bb.menuRect), even if it hangs onto a
@@ -1793,6 +1968,9 @@ test {
     _ = @import("flac.zig");
     _ = @import("journal.zig");
     _ = @import("maxstring.zig");
+    _ = @import("mp4.zig");
+    _ = @import("novideo.zig");
+    _ = webcam;
 }
 
 const builtin = @import("builtin");
@@ -1801,4 +1979,5 @@ const win32 = @import("win32").everything;
 const wintrace = @import("wintrace");
 const bb = @import("bb.zig");
 const wasapi = @import("wasapi.zig");
+const webcam = @import("webcam.zig");
 const record = @import("record.zig");

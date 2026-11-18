@@ -3,7 +3,7 @@
 //! While recording, every source's data is appended to the journal as chunks, in the order it
 //! arrives, so data captured around the same time sits close together on disk. Each source's
 //! chunks are in order; different sources' chunks interleave. A background thread reads the
-//! chunks back and writes the final per-track files (FLAC).
+//! chunks back and writes the final per-track files (FLAC for audio, MP4 for video).
 //!
 //! A journal file is a ring on disk, like the audio rings in memory: a FileHeader, then a data
 //! area of `capacity` bytes that the writer fills and the compressor frees, wrapping around.
@@ -62,15 +62,28 @@ pub const Kind = enum(u8) {
     padding = 5,
     /// The file's last chunk: the journal continues in the next file. No payload.
     segment_end = 6,
+    /// A video track's first chunk. Payload: VideoTrackStart then its strings.
+    video_track_start = 7,
+    /// Encoded video, as the encoder delivered it: the payload is Records (`frames` 1, see
+    /// Record), each followed by its frame. The header's frames, first_frame and capture_qpc
+    /// sum up the records, as for audio.
+    video = 8,
     _,
 };
 
 pub const Flags = packed struct(u8) {
-    _: u8 = 0,
+    /// track_end: the track ended because the recording did, its source still going (not
+    /// removed, not failed): a webcam's file shows no "NO VIDEO" after its last frame.
+    recording_end: bool = false,
+    _: u7 = 0,
 };
 
 /// One packet of audio in an audio chunk, followed by `len` bytes of samples in TrackStart's
-/// format (none when silent).
+/// format (none when silent). Or one frame of video in a video chunk, as the encoder gave it,
+/// followed by `len` bytes: a VideoFrame, then the H.264 (Annex B: NAL units after start
+/// codes). For video, `frames` is 1, `first_frame` the frame's number in the order the encoder
+/// gave them (from the capture's first, each one more than the last), and `capture_qpc` when
+/// it's shown.
 pub const Record = extern struct {
     frames: u32,
     flags: RecordFlags,
@@ -88,6 +101,19 @@ pub const Record = extern struct {
     }
 };
 
+/// What a video record says beyond Record, before its H.264.
+pub const VideoFrame = extern struct {
+    /// When the frame is decoded, QPC in 100ns units, as the encoder gave it: frames shown
+    /// ahead of others (B-frames) are decoded after them.
+    decode_qpc: u64,
+    /// Frames the encoder refused (it was busy) since the capture started: dropped.
+    refused: u64,
+
+    comptime {
+        std.debug.assert(@sizeOf(VideoFrame) == 16);
+    }
+};
+
 pub const RecordFlags = packed struct(u32) {
     /// Digital silence: `frames` of zeros, not stored.
     silent: bool = false,
@@ -96,7 +122,9 @@ pub const RecordFlags = packed struct(u32) {
     /// Windows said audio was lost before this (AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY).
     /// first_frame says how much.
     discontinuity: bool = false,
-    _: u29 = 0,
+    /// Video: a keyframe (an IDR picture, with its SPS and PPS), which decodes on its own.
+    keyframe: bool = false,
+    _: u28 = 0,
 };
 
 pub const Header = extern struct {
@@ -169,6 +197,38 @@ pub const TrackStart = extern struct {
 
 pub const SampleType = enum(u8) { f32 = 1, i16 = 2, i24 = 3, i32 = 4, _ };
 
+/// A video_track_start chunk's payload starts with this, then `device_name_len` bytes of the
+/// device's name, `file_name_len` bytes of the final file's name and `encoder_name_len`
+/// bytes of the encoder's name (UTF-8), then `novideo_len` bytes of what its file shows while
+/// there's no video from the webcam: an mp4.NoVideoRun, frames the webcam's encoder made of
+/// novideo.zig's picture, so whatever decodes the webcam's frames decodes them.
+pub const VideoTrackStart = extern struct {
+    /// Always h264 so far.
+    codec: Codec,
+    /// The encoder is the GPU's.
+    hardware: u8,
+    reserved0: u16 = 0,
+    width: u32,
+    height: u32,
+    /// Frames per second, as a fraction, as the camera was asked for. Frames are timed by
+    /// their capture times, not this.
+    fps_num: u32,
+    fps_den: u32,
+    /// The encoder's target, bits per second.
+    bitrate: u32,
+    device_name_len: u16,
+    file_name_len: u16,
+    encoder_name_len: u16,
+    reserved1: u16 = 0,
+    novideo_len: u32,
+
+    pub const Codec = enum(u8) { h264 = 1, _ };
+
+    comptime {
+        std.debug.assert(@sizeOf(VideoTrackStart) == 36);
+    }
+};
+
 /// Fails, naming the field, unless `T.field` is at byte `offset`.
 fn expectOffset(comptime T: type, comptime field: []const u8, offset: usize) !void {
     if (@offsetOf(T, field) == offset) return;
@@ -209,6 +269,14 @@ test "the layout on disk" {
     try std.testing.expectEqual(0, @bitOffsetOf(RecordFlags, "silent"));
     try std.testing.expectEqual(1, @bitOffsetOf(RecordFlags, "timestamp_error"));
     try std.testing.expectEqual(2, @bitOffsetOf(RecordFlags, "discontinuity"));
+    try std.testing.expectEqual(3, @bitOffsetOf(RecordFlags, "keyframe"));
+
+    // Chunk kinds are numbers on the disk too.
+    const kinds = [_]struct { Kind, u8 }{
+        .{ .track_start, 1 }, .{ .audio, 2 },             .{ .track_end, 3 }, .{ .recording_end, 4 },
+        .{ .padding, 5 },     .{ .segment_end, 6 },       .{ .video_track_start, 7 }, .{ .video, 8 },
+    };
+    for (kinds) |k| try std.testing.expectEqual(k[1], @intFromEnum(k[0]));
 
     try expectOffset(TrackStart, "sample", 0);
     try expectOffset(TrackStart, "channels", 1);
@@ -222,6 +290,18 @@ test "the layout on disk" {
     try expectOffset(TrackStart, "raw", 18);
     try expectOffset(TrackStart, "device_name_len", 20);
     try expectOffset(TrackStart, "file_name_len", 22);
+
+    try expectOffset(VideoTrackStart, "codec", 0);
+    try expectOffset(VideoTrackStart, "hardware", 1);
+    try expectOffset(VideoTrackStart, "width", 4);
+    try expectOffset(VideoTrackStart, "height", 8);
+    try expectOffset(VideoTrackStart, "fps_num", 12);
+    try expectOffset(VideoTrackStart, "fps_den", 16);
+    try expectOffset(VideoTrackStart, "bitrate", 20);
+    try expectOffset(VideoTrackStart, "device_name_len", 24);
+    try expectOffset(VideoTrackStart, "file_name_len", 26);
+    try expectOffset(VideoTrackStart, "encoder_name_len", 28);
+    try std.testing.expectEqual(1, @intFromEnum(VideoTrackStart.Codec.h264));
 
     const h: Header = .{ .len = 0, .track = 0, .seq = 0, .kind = .audio };
     try std.testing.expectEqualStrings("BBCH", std.mem.asBytes(&h)[0..4]);
