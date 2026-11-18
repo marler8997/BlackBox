@@ -1734,5 +1734,577 @@ fn formatBytes(n: u64, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.print("{d:.1} {s}", .{ v, units[i] });
 }
 
+// ---------------------------------------------------------------------------
+// Tests. They drive the app as the platform does: input, then paint (which lays out what's
+// clicked next) into a TestPainter that keeps the text drawn.
+// ---------------------------------------------------------------------------
+
+/// A painter that draws nothing but keeps every text drawn, with its rect and color, so a test
+/// can check what's on screen. Text is copied: callers often pass their own stack buffers.
+const TestPainter = struct {
+    texts: [max_texts]Text = undefined,
+    count: usize = 0,
+    chars: [8192]u8 = undefined,
+    chars_len: usize = 0,
+
+    const max_texts = 128;
+    const Text = struct { start: usize, len: usize, rect: Rect, font: Font, color: Color };
+
+    fn clear(_: *TestPainter, _: Color) void {}
+    fn fill(_: *TestPainter, _: Rect, _: Color) void {}
+    fn ellipse(_: *TestPainter, _: Rect, _: Color) void {}
+    fn pill(_: *TestPainter, _: Rect, _: Color) void {}
+    fn icon(_: *TestPainter, _: Icon, _: Rect, _: Font, _: Color) void {}
+    fn band(_: *TestPainter, _: i32, upper: []const i32, lower: []const i32, _: Gradient) void {
+        if (upper.len != lower.len or upper.len > band_columns) std.debug.panic("band of {d} uppers and {d} lowers, at most {d}", .{ upper.len, lower.len, band_columns });
+        for (upper, lower, 0..) |u, l, i| if (u > l) std.debug.panic("band column {d} is upside down: {d} above {d}", .{ i, u, l });
+    }
+    fn text(p: *TestPainter, t: []const u8, r: Rect, font: Font, c: Color, _: Align) void {
+        if (p.count == max_texts or p.chars_len + t.len > p.chars.len) std.debug.panic("TestPainter is full, can't keep '{s}'", .{t});
+        @memcpy(p.chars[p.chars_len..][0..t.len], t);
+        p.texts[p.count] = .{ .start = p.chars_len, .len = t.len, .rect = r, .font = font, .color = c };
+        p.count += 1;
+        p.chars_len += t.len;
+    }
+    /// A monospace stand-in, for Painter.textWidth and menuRect's measure alike.
+    fn textWidth(_: *TestPainter, t: []const u8, _: Font) i32 {
+        return @intCast(t.len * 8);
+    }
+    fn width(p: *TestPainter, t: []const u8, f: Font) i32 {
+        return p.textWidth(t, f);
+    }
+
+    fn slice(p: *const TestPainter, t: Text) []const u8 {
+        return p.chars[t.start..][0..t.len];
+    }
+    /// The text drawn exactly as `s`, if it was.
+    fn find(p: *const TestPainter, s: []const u8) ?Text {
+        for (p.texts[0..p.count]) |t| if (std.mem.eql(u8, p.slice(t), s)) return t;
+        return null;
+    }
+    /// The text of the one badge drawn (Font.badge), if any. Fails if there are several.
+    fn badge(p: *const TestPainter) !?[]const u8 {
+        var found: ?[]const u8 = null;
+        for (p.texts[0..p.count]) |t| if (t.font == .badge) {
+            if (found) |f| {
+                std.debug.print("two badges drawn: '{s}' and '{s}'\n", .{ f, p.slice(t) });
+                return error.TestUnexpectedResult;
+            }
+            found = p.slice(t);
+        };
+        return found;
+    }
+    /// Fails, listing what was drawn, unless `s` was.
+    fn expectText(p: *const TestPainter, s: []const u8) !void {
+        if (p.find(s) != null) return;
+        std.debug.print("'{s}' wasn't drawn, these were:\n", .{s});
+        for (p.texts[0..p.count]) |t| std.debug.print("  '{s}'\n", .{p.slice(t)});
+        return error.TestExpectedEqual;
+    }
+};
+
+const test_w = 600;
+const test_h = 400;
+
+/// Paints the window as the platform would, at 96 DPI, so the next input hits what's on screen.
+fn testPaint(p: *TestPainter) void {
+    p.* = .{};
+    paint(p, test_w, test_h, 96);
+}
+
+/// Lays out and paints the open menu, as the platform does when it opens.
+fn testPaintMenu(p: *TestPainter) void {
+    p.* = .{};
+    const r = menuRect(96, p);
+    paintMenu(p, r.right - r.left, 96);
+}
+
+fn testCenter(r: Rect) Point {
+    std.debug.assert(r.right > r.left and r.bottom > r.top);
+    return .{ .x = @divTrunc(r.left + r.right, 2), .y = @divTrunc(r.top + r.bottom, 2) };
+}
+
+/// Presses and releases the left button in the middle of `r` (as last painted).
+fn testClick(r: Rect) void {
+    const c = testCenter(r);
+    _ = onMouseDown(c.x, c.y);
+    _ = onMouseUp(c.x, c.y);
+}
+
+/// Clicks the open menu's row `i` (menuRect must have laid it out). Returns whether an item
+/// was chosen.
+fn testClickMenuRow(i: usize) bool {
+    const y = @as(i32, @intCast(i)) * state.menu_row_h + @divTrunc(state.menu_row_h, 2);
+    onMenuMouseDown(10, y);
+    return onMenuMouseUp(10, y);
+}
+
+/// A device as the platform lists it, its strings owned by bb's allocator.
+fn testDevice(name: []const u8, form: ?Device.Form) !Device {
+    const n = try gpa.dupe(u8, name);
+    errdefer gpa.free(n);
+    return .{ .name = n, .id = try std.fmt.allocPrint(gpa, "id:{s}", .{name}), .format = null, .form = form };
+}
+
+test "the record button needs something to record, but can always stop" {
+    init(std.testing.allocator);
+    defer deinit();
+    var p: TestPainter = .{};
+    testPaint(&p);
+    // Nothing to record: neither a click nor the keyboard starts a recording.
+    testClick(state.button);
+    try std.testing.expect(!isRecording());
+    try std.testing.expect(!onKeyActivate());
+    try std.testing.expect(!isRecording());
+
+    addSource(.microphone, try testDevice("Mic", .microphone));
+    testPaint(&p);
+    testClick(state.button);
+    try std.testing.expect(isRecording());
+    // With the last source gone mid-recording, it can still be stopped.
+    removeSource(state.sources.items[0].id);
+    testPaint(&p);
+    testClick(state.button);
+    try std.testing.expect(!isRecording());
+}
+
+test "a button acts on release, only if the press started there and never left" {
+    init(std.testing.allocator);
+    defer deinit();
+    var p: TestPainter = .{};
+    testPaint(&p);
+    const pin = testCenter(state.pin_button);
+    const collapse = testCenter(state.collapse_button);
+    // The margin is nothing: there a press drags the window.
+    try std.testing.expect(isDragArea(1, 1));
+    try std.testing.expect(!isDragArea(pin.x, pin.y));
+
+    testClick(state.pin_button);
+    try std.testing.expect(settings().always_on_top);
+
+    // Moved off and back before the release: abandoned.
+    try std.testing.expect(onMouseDown(pin.x, pin.y));
+    try std.testing.expect(onMouseMove(1, 1));
+    try std.testing.expect(onMouseMove(pin.x, pin.y));
+    try std.testing.expect(!onMouseUp(pin.x, pin.y));
+    try std.testing.expect(settings().always_on_top);
+
+    // Pressed on one button, released on another: neither acts.
+    _ = onMouseDown(pin.x, pin.y);
+    _ = onMouseUp(collapse.x, collapse.y);
+    try std.testing.expect(settings().always_on_top);
+    try std.testing.expect(!settings().collapsed);
+
+    // Moving within the same button needs no repaint, and keeps the press.
+    _ = onMouseDown(pin.x, pin.y);
+    try std.testing.expect(!onMouseMove(pin.x + 1, pin.y));
+    _ = onMouseUp(pin.x + 1, pin.y);
+    try std.testing.expect(!settings().always_on_top);
+
+    testClick(state.minimize_button);
+    try std.testing.expect(takeMinimize());
+    try std.testing.expect(!takeMinimize());
+}
+
+test "adding a device: listed in order, each added once, the list freed with the menu" {
+    init(std.testing.allocator);
+    defer deinit();
+    var p: TestPainter = .{};
+    testPaint(&p);
+
+    testClick(state.add_buttons[@intFromEnum(SourceKind.microphone)]);
+    try std.testing.expectEqual(Menu{ .devices = .microphone }, openMenu().?);
+    // The platform lists them once per opening, in its own order.
+    try std.testing.expectEqual(SourceKind.microphone, takeDeviceListRequest().?);
+    try std.testing.expectEqual(null, takeDeviceListRequest());
+    const listed = [_]struct { []const u8, ?Device.Form }{
+        .{ "zeta", .microphone },
+        .{ "Unknown thing", null },
+        .{ "Headset Mic", .headset },
+        .{ "alpha", .microphone },
+        .{ "Beta", .microphone },
+    };
+    for (listed) |d| addDevice(try testDevice(d[0], d[1]));
+    // By form (as Form lists them, unknown last), then name ignoring case.
+    const sorted = [_][]const u8{ "Headset Mic", "alpha", "Beta", "zeta", "Unknown thing" };
+    for (sorted, listedDevices()) |name, d| try std.testing.expectEqualStrings(name, d.name);
+
+    testPaintMenu(&p);
+    try std.testing.expect(testClickMenuRow(1));
+    try std.testing.expectEqual(null, openMenu());
+    try std.testing.expectEqual(0, listedDevices().len);
+    try std.testing.expectEqual(1, sources().len);
+    try std.testing.expectEqualStrings("alpha", sources()[0].name());
+    try std.testing.expectEqualStrings("id:alpha", sources()[0].device.?.id);
+
+    // Listed again: the one already added is checked and can't be chosen again.
+    testPaint(&p);
+    testClick(state.add_buttons[@intFromEnum(SourceKind.microphone)]);
+    _ = takeDeviceListRequest();
+    for (listed) |d| addDevice(try testDevice(d[0], d[1]));
+    const row = menuRow(state.menu.?, 1);
+    try std.testing.expect(row.checked and row.item == null);
+    testPaintMenu(&p);
+    try std.testing.expect(!testClickMenuRow(1));
+    try std.testing.expect(openMenu() != null);
+    // Below the last row is nothing.
+    try std.testing.expect(!testClickMenuRow(listed.len));
+    // A click in the window only closes the menu (and frees the list, else the testing
+    // allocator reports a leak).
+    try std.testing.expect(onMouseDown(1, 1));
+    try std.testing.expectEqual(null, openMenu());
+    try std.testing.expectEqual(1, sources().len);
+
+    // None to list: the menu says so, with nothing to choose.
+    testClick(state.add_buttons[@intFromEnum(SourceKind.system_audio)]);
+    _ = takeDeviceListRequest();
+    testPaintMenu(&p);
+    try p.expectText("No outputs found");
+    try std.testing.expect(!testClickMenuRow(0));
+}
+
+test "a kind not recordable yet says so instead of adding" {
+    init(std.testing.allocator);
+    defer deinit();
+    var p: TestPainter = .{};
+    testPaint(&p);
+    for ([_]SourceKind{ .screen, .webcam }) |kind| {
+        testClick(state.add_buttons[@intFromEnum(kind)]);
+        try std.testing.expectEqual(Menu{ .todo = kind }, openMenu().?);
+        try std.testing.expectEqual(null, takeDeviceListRequest());
+        testPaintMenu(&p);
+        try p.expectText(kind.todo().?);
+        try std.testing.expect(!testClickMenuRow(0));
+        _ = closeMenu();
+    }
+    try std.testing.expectEqual(0, sources().len);
+}
+
+test "a track's rows depend on its kind, never its state" {
+    var buf: [std.enums.values(TrackRow).len]TrackRow = undefined;
+    const live: SourceStatus = .{ .live = .{ .format = .{ .sample = .float, .bits = 32, .rate = 48000, .channels = 2 }, .raw = true } };
+    const statuses = [_]SourceStatus{ .starting, live, .{ .failed = .init("no device", .{}) } };
+    const buffers = [_]?Buffer{ null, .{ .bytes = 1 << 20, .ms = 5000 } };
+    for (std.enums.values(SourceKind)) |kind| {
+        const want: []const TrackRow = switch (kind) {
+            .microphone, .system_audio => &.{ .name, .device_format, .captured_as, .effects, .buffer, .clips, .remove },
+            .screen, .webcam => &.{ .name, .remove },
+        };
+        for (statuses) |status| for (buffers) |buffer| {
+            const src: Source = .{ .kind = kind, .id = 1, .device = null, .status = status, .buffer = buffer, .clips_cleared = 3 };
+            try std.testing.expectEqualSlices(TrackRow, want, trackRows(&src, &buf));
+        };
+    }
+}
+
+test "a track's menu clears the clips it showed, and removes the track" {
+    init(std.testing.allocator);
+    defer deinit();
+    var p: TestPainter = .{};
+    var meter: Meter = .{};
+    addSource(.microphone, try testDevice("Mic", .microphone));
+    const id = sources()[0].id;
+    setSourceMeter(id, &meter);
+    setSourceStatus(id, .{ .live = .{ .format = .{ .sample = .float, .bits = 32, .rate = 48000, .channels = 2 }, .raw = true } });
+    // Two runs of clipping: two clips.
+    for ([_]f32{ 1.0, 1.2, 0.5, 1.0 }) |peak| meter.push(peak, 0.1);
+    testPaint(&p);
+    try std.testing.expectEqualStrings("2", (try p.badge()).?);
+    testClick(findSource(id).?.track_button);
+    try std.testing.expectEqual(Menu{ .track = id }, openMenu().?);
+    testPaintMenu(&p);
+    try p.expectText("Mic");
+    try p.expectText("Captured as 32-bit float, 48000 Hz, 2 ch");
+    try p.expectText("Raw: Windows audio effects bypassed");
+    try p.expectText("Clipped 2\u{00D7} \u{00B7} Clear");
+
+    // Clipping again while the menu's open: that one wasn't shown, so it stays.
+    meter.push(0.1, 0.1);
+    meter.push(1.0, 0.1);
+    try std.testing.expect(testClickMenuRow(5));
+    try std.testing.expectEqual(1, findSource(id).?.clips());
+
+    testPaint(&p);
+    testClick(findSource(id).?.track_button);
+    testPaintMenu(&p);
+    try std.testing.expect(testClickMenuRow(6));
+    try std.testing.expectEqual(0, sources().len);
+}
+
+test "the clip badge counts to 99" {
+    init(std.testing.allocator);
+    defer deinit();
+    var p: TestPainter = .{};
+    var meter: Meter = .{};
+    addSource(.microphone, null);
+    setSourceMeter(sources()[0].id, &meter);
+    // No clips, no badge.
+    testPaint(&p);
+    try std.testing.expectEqual(null, try p.badge());
+    for (0..100) |_| {
+        meter.push(1.0, 0.5);
+        meter.push(0.0, 0.0);
+    }
+    testPaint(&p);
+    try std.testing.expectEqualStrings("99+", (try p.badge()).?);
+    state.sources.items[0].clips_cleared = 1;
+    testPaint(&p);
+    try std.testing.expectEqualStrings("99", (try p.badge()).?);
+    state.sources.items[0].clips_cleared = 91;
+    testPaint(&p);
+    try std.testing.expectEqualStrings("9", (try p.badge()).?);
+    // All cleared: gone again.
+    state.sources.items[0].clips_cleared = 100;
+    testPaint(&p);
+    try std.testing.expectEqual(null, try p.badge());
+}
+
+test "collapsed: only the top bar shows and can be clicked" {
+    init(std.testing.allocator);
+    defer deinit();
+    var p: TestPainter = .{};
+    addSource(.microphone, null);
+    testPaint(&p);
+    const track = testCenter(state.sources.items[0].track_button);
+    testClick(state.collapse_button);
+    try std.testing.expect(settings().collapsed);
+    testPaint(&p);
+    try std.testing.expect(isDragArea(track.x, track.y));
+    for (state.add_buttons) |r| try std.testing.expectEqual(empty_rect, r);
+    testClick(state.collapse_button);
+    try std.testing.expect(!settings().collapsed);
+
+    // Its height: the margins and the bar, and room for a capture warning, which must show.
+    try std.testing.expectEqual(16 + 36 + 16, collapsedHeight(96));
+    try std.testing.expectEqual(24 + 54 + 24, collapsedHeight(144));
+    setCaptureExclusion(.{ .failed = 5 });
+    try std.testing.expectEqual(16 + 36 + 16 + 24 + 8, collapsedHeight(96));
+    testPaint(&p);
+    try p.expectText("Warning: hiding this window from screen capture failed (error 5), it may appear in recordings.");
+    // Not excluding: nothing to warn about.
+    testClick(state.more_button);
+    testPaintMenu(&p);
+    try std.testing.expect(testClickMenuRow(0));
+    try std.testing.expect(!settings().exclude_from_capture);
+    try std.testing.expectEqual(16 + 36 + 16, collapsedHeight(96));
+}
+
+test "the more menu's Quit" {
+    init(std.testing.allocator);
+    defer deinit();
+    var p: TestPainter = .{};
+    testPaint(&p);
+    testClick(state.more_button);
+    testPaintMenu(&p);
+    try std.testing.expect(!quitRequested());
+    try std.testing.expect(testClickMenuRow(1));
+    try std.testing.expect(quitRequested());
+}
+
+test "the status: how long the disk lasts at the tracks' rate" {
+    init(std.testing.allocator);
+    defer deinit();
+    var p: TestPainter = .{};
+    testPaint(&p);
+    try p.expectText("Checking free space\u{2026}");
+
+    var mic = try testDevice("Mic", .microphone);
+    mic.format = .{ .sample = .integer, .bits = 16, .rate = 48000, .channels = 2 };
+    addSource(.microphone, mic);
+    // 16-bit stereo at 48 kHz, captured as float: FLAC keeps the device's 16 bits, at 60%,
+    // 115.2 KB/s. 5 h 20 m of that.
+    const rate = 48000 * 2 * 2 * 6 / 10;
+    setDisk(.{ .free = rate * (5 * 3600 + 20 * 60), .total = 1 << 40 });
+    testPaint(&p);
+    // Not capturing yet: no rate to go by.
+    try p.expectText("2.2 GB free");
+
+    var meter: Meter = .{};
+    const id = sources()[0].id;
+    setSourceMeter(id, &meter);
+    setSourceStatus(id, .{ .live = .{ .format = .{ .sample = .float, .bits = 32, .rate = 48000, .channels = 2 }, .raw = false } });
+    testPaint(&p);
+    try p.expectText("5 hours 20 minutes left");
+    try p.expectText("2.2 GB \u{00B7} 115.2 KB/s");
+
+    // A device whose format isn't known: what's captured, up to the 24 bits FLAC stores.
+    state.sources.items[0].device.?.format = null;
+    testPaint(&p);
+    try p.expectText("2.2 GB \u{00B7} 172.8 KB/s");
+
+    // A failure takes the status' place until the next recording starts.
+    recordingFailed(.init("disk full", .{}));
+    testPaint(&p);
+    try p.expectText("disk full");
+    try std.testing.expectEqual(null, p.find("2.2 GB \u{00B7} 172.8 KB/s"));
+    try std.testing.expect(!isRecording());
+    testClick(state.button);
+    testPaint(&p);
+    try std.testing.expectEqual(null, p.find("disk full"));
+}
+
+test "the timeline's time" {
+    init(std.testing.allocator);
+    defer deinit();
+    var p: TestPainter = .{};
+    addSource(.microphone, null);
+    testPaint(&p);
+    try p.expectText("0:00");
+    setRecordingElapsed(65_999);
+    testPaint(&p);
+    try p.expectText("1:05");
+    setRecordingElapsed((1 * 3600 + 2 * 60 + 5) * 1000);
+    testPaint(&p);
+    try p.expectText("1:02:05");
+}
+
+test "a frame is painted only when it would look different" {
+    init(std.testing.allocator);
+    defer deinit();
+    var p: TestPainter = .{};
+    try std.testing.expect(!animating());
+    var meter: Meter = .{};
+    addSource(.microphone, null);
+    const id = sources()[0].id;
+    setSourceMeter(id, &meter);
+    // Starting: nothing moves yet.
+    try std.testing.expect(!animating());
+    setSourceStatus(id, .{ .live = .{ .format = .{ .sample = .float, .bits = 32, .rate = 48000, .channels = 1 }, .raw = false } });
+    try std.testing.expect(animating());
+
+    testPaint(&p);
+    try std.testing.expect(!frameChanged(null));
+    // A bucket at a time, until the lane gains a column.
+    const columns = state.sources.items[0].painted_columns;
+    var pushed: usize = 0;
+    while (levelColumns(meter.count.load(.monotonic), state.sources.items[0].painted_width) == columns) : (pushed += 1) {
+        try std.testing.expect(!frameChanged(null));
+        meter.push(0.5, 0.5);
+    }
+    try std.testing.expect(pushed > 0);
+    try std.testing.expect(frameChanged(null));
+    testPaint(&p);
+    try std.testing.expect(!frameChanged(null));
+
+    // The time changes each whole second, and when it appears.
+    try std.testing.expect(frameChanged(999));
+    setRecordingElapsed(1000);
+    try std.testing.expect(!frameChanged(1999));
+    try std.testing.expect(frameChanged(2000));
+
+    // Collapsed, the levels don't show.
+    state.settings.collapsed = true;
+    try std.testing.expect(!animating());
+    meter.push(0.5, 0.5);
+    meter.push(0.5, 0.5);
+    meter.push(0.5, 0.5);
+    try std.testing.expect(!frameChanged(1000));
+}
+
+// levelColumns is the closed form of counting the columns c with (c + 1) * shown / width <=
+// count; this counts them.
+test levelColumns {
+    for ([_]u64{ 1, 7, 333, 528, 999, 1000, 1001, 2560, 4000 }) |width| {
+        for ([_]u64{ 0, 1, 2, 3, 99, 999, 1000, 1001, 123_456 }) |count| {
+            var complete: u64 = 0;
+            while ((complete + 1) * levels_shown / width <= count) complete += 1;
+            if (levelColumns(count, width) != complete) {
+                std.debug.print("width {d}, count {d}: levelColumns says {d}, there are {d}\n", .{ width, count, levelColumns(count, width), complete });
+                return error.TestExpectedEqual;
+            }
+        }
+    }
+}
+
+test meterFraction {
+    try std.testing.expectEqual(0, meterFraction(-std.math.inf(f32)));
+    try std.testing.expectEqual(0, meterFraction(-70));
+    try std.testing.expectApproxEqAbs(0.5, meterFraction(-20), 1e-6);
+    try std.testing.expectApproxEqAbs(0.85, meterFraction(-6), 1e-6);
+    try std.testing.expectEqual(1, meterFraction(0));
+    try std.testing.expectEqual(1, meterFraction(6));
+    // Continuous and rising: no jumps at the segments' joins, so a level rising smoothly
+    // moves smoothly.
+    var prev = meterFraction(-80);
+    var db: f32 = -80;
+    while (db <= 1) : (db += 0.125) {
+        const f = meterFraction(db);
+        if (f < prev or f - prev > 0.125 * 0.025 + 1e-5) {
+            std.debug.print("meterFraction jumps from {d} to {d} at {d} dB\n", .{ prev, f, db });
+            return error.TestUnexpectedResult;
+        }
+        prev = f;
+    }
+}
+
+test "the meter counts each run of clipping once, and keeps the newest buckets" {
+    var meter: Meter = .{};
+    for ([_]f32{ 0.5, 1.0, 1.0, 2.0, 0.99999994, 1.0, 0.0, 1.0 }) |peak| meter.push(peak, 0.25);
+    try std.testing.expectEqual(3, meter.clips.load(.monotonic));
+    try std.testing.expectEqual(8, meter.count.load(.monotonic));
+    // Linear, rounded: full scale is 65534.
+    try std.testing.expectEqual(32767, meter.bucket(0).peak);
+    try std.testing.expectEqual(16384, meter.bucket(0).loudness);
+    try std.testing.expectEqual(Meter.Bucket.clipped, meter.bucket(3).peak);
+    // Just under full scale isn't a clip, however it rounds.
+    try std.testing.expectEqual(Meter.Bucket.full, meter.bucket(4).peak);
+    try std.testing.expectEqual(0, meter.bucket(6).peak);
+
+    // Round the ring: bucket n is in slot n % len.
+    for (0..Meter.len) |i| meter.push(@as(f32, @floatFromInt(i % 100)) / 100, 0);
+    const n = meter.count.load(.monotonic);
+    try std.testing.expectEqual(8 + Meter.len, n);
+    try std.testing.expectEqual(Meter.Bucket.encode(@as(f32, @floatFromInt((Meter.len - 1) % 100)) / 100), meter.bucket(n - 1).peak);
+    try std.testing.expectEqual(3, meter.clips.load(.monotonic));
+}
+
+test "a message too long for its buffer ends in an ellipsis" {
+    const short: Message = .init("{s} failed, error {d}", .{ "Start", 5 });
+    try std.testing.expectEqualStrings("Start failed, error 5", short.slice());
+    const xs: [300]u8 = @splat('x');
+    const long: Message = .init("{s}", .{&xs});
+    try std.testing.expectEqualStrings(xs[0..197] ++ "...", long.slice());
+}
+
+test fmtDuration {
+    const cases = [_]struct { u64, []const u8 }{
+        .{ 0, "0 seconds" },
+        .{ 1, "1 second" },
+        .{ 59, "59 seconds" },
+        .{ 60, "1 minute" },
+        .{ 119, "1 minute" },
+        .{ 3599, "59 minutes" },
+        .{ 3600, "1 hour" },
+        .{ 3660, "1 hour 1 minute" },
+        .{ 2 * 3600 + 2 * 60, "2 hours 2 minutes" },
+        .{ 10 * 3600 - 1, "9 hours 59 minutes" },
+        // From ten hours, minutes are noise.
+        .{ 10 * 3600 + 59 * 60, "10 hours" },
+        .{ 1240 * 3600, "1,240 hours" },
+        .{ 1_000_005 * 3600, "1,000,005 hours" },
+    };
+    for (cases) |c| {
+        var buf: [64]u8 = undefined;
+        try std.testing.expectEqualStrings(c[1], try std.fmt.bufPrint(&buf, "{f}", .{fmtDuration(c[0])}));
+    }
+}
+
+test fmtBytes {
+    const cases = [_]struct { u64, []const u8 }{
+        .{ 0, "0.0 B" },
+        .{ 999, "999.0 B" },
+        .{ 1000, "1.0 KB" },
+        .{ 1_500_000, "1.5 MB" },
+        .{ 2_211_840_000, "2.2 GB" },
+        .{ 3_000_000_000_000, "3.0 TB" },
+        // TB is the largest unit.
+        .{ 5_000_000_000_000_000, "5000.0 TB" },
+    };
+    for (cases) |c| {
+        var buf: [64]u8 = undefined;
+        try std.testing.expectEqualStrings(c[1], try std.fmt.bufPrint(&buf, "{f}", .{fmtBytes(c[0])}));
+    }
+}
+
 const std = @import("std");
 const maxstring = @import("maxstring.zig");

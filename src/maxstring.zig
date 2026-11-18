@@ -220,10 +220,51 @@ pub fn BoundedString(comptime encoding: Encoding, comptime sentinel: Sentinel, c
         pub fn format(self: Self, writer: *std.Io.Writer) error{WriteFailed}!void {
             switch (encoding) {
                 .utf8 => try writer.writeAll(self.slice()),
-                .wtf16 => try writer.print("{}", .{std.unicode.fmtUtf16Le(self.slice())}),
+                .wtf16 => try writer.print("{f}", .{std.unicode.fmtUtf16Le(self.slice())}),
             }
         }
     };
+}
+
+// The buffer has room for the longest text each part can be, and no more: the largest
+// unsigned, the most negative signed, the longest enum name, a string at its maximum.
+test "MaxString: room for every part's longest" {
+    const Kind = enum { a, longest_name };
+    const S = MaxString(.utf8, .no_sentinel, &.{
+        .{ .static = "n=" },
+        .{ .runtime_value = .{ .name = "n", .type = u64 } },
+        .{ .static = " i=" },
+        .{ .runtime_value = .{ .name = "i", .type = i32 } },
+        .{ .static = " b=" },
+        .{ .runtime_value = .{ .name = "b", .type = u8 } },
+        .{ .static = " k=" },
+        .{ .runtime_value = .{ .name = "k", .type = Kind } },
+        .{ .static = " s=" },
+        .{ .runtime_utf8 = .{ .name = "s", .max_len = 5 } },
+    });
+    const longest = S.format(.{ .n = std.math.maxInt(u64), .i = std.math.minInt(i32), .b = 255, .k = .longest_name, .s = "h\u{e9}ll" });
+    try std.testing.expectEqualStrings("n=18446744073709551615 i=-2147483648 b=255 k=longest_name s=h\u{e9}ll", longest.slice());
+    try std.testing.expectEqual(S.max_len, longest.slice().len);
+    const shortest = S.format(.{ .n = 0, .i = 0, .b = 0, .k = .a, .s = "" });
+    try std.testing.expectEqualStrings("n=0 i=0 b=0 k=a s=", shortest.slice());
+}
+
+test "MaxString: WTF-16 with a sentinel, as Windows takes strings" {
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    const S = MaxString(.wtf16, .yes_sentinel, &.{
+        .{ .static = L("Track ") },
+        .{ .runtime_value = .{ .name = "n", .type = u32 } },
+        .{ .static = L(": ") },
+        .{ .runtime_wtf16 = .{ .name = "name", .max_len = 8 } },
+    });
+    try std.testing.expectEqual(6 + 10 + 2 + 8, S.max_len);
+    const s = S.format(.{ .n = 4294967295, .name = L("Mic \u{e9}") });
+    const text: [:0]const u16 = s.slice();
+    try std.testing.expectEqualSlices(u16, L("Track 4294967295: Mic \u{e9}"), text);
+    try std.testing.expectEqual(0, text.ptr[text.len]);
+    // Printed as UTF-8.
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Track 4294967295: Mic \u{e9}", try std.fmt.bufPrint(&buf, "{f}", .{s}));
 }
 
 const builtin = @import("builtin");

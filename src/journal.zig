@@ -130,7 +130,7 @@ pub const Header = extern struct {
 
     /// Bytes the chunk takes in the data area, its alignment padding included.
     pub fn size(h: *const Header) u64 {
-        return std.mem.alignForward(u64, @sizeOf(Header) + h.len, chunk_align);
+        return std.mem.alignForward(u64, @as(u64, @sizeOf(Header)) + h.len, chunk_align);
     }
 
     /// The CRC for this header and a payload in one or more pieces.
@@ -168,5 +168,216 @@ pub const TrackStart = extern struct {
 };
 
 pub const SampleType = enum(u8) { f32 = 1, i16 = 2, i24 = 3, i32 = 4, _ };
+
+/// Fails, naming the field, unless `T.field` is at byte `offset`.
+fn expectOffset(comptime T: type, comptime field: []const u8, offset: usize) !void {
+    if (@offsetOf(T, field) == offset) return;
+    std.debug.print("{s}.{s} is at byte {d}, version 1 has it at {d}\n", .{ @typeName(T), field, @offsetOf(T, field), offset });
+    return error.TestExpectedEqual;
+}
+
+// Recovery reads journals an older or newer build wrote: a field that moves breaks every
+// recording made before it. These are where version 1 has every field but the reserved ones.
+test "the layout on disk" {
+    try expectOffset(Header, "magic", 0);
+    try expectOffset(Header, "crc", 4);
+    try expectOffset(Header, "len", 8);
+    try expectOffset(Header, "track", 12);
+    try expectOffset(Header, "seq", 16);
+    try expectOffset(Header, "kind", 20);
+    try expectOffset(Header, "flags", 21);
+    try expectOffset(Header, "frames", 24);
+    try expectOffset(Header, "first_frame", 32);
+    try expectOffset(Header, "capture_qpc", 40);
+    try expectOffset(Header, "write_qpc", 48);
+    try expectOffset(Header, "journal_seq", 56);
+
+    try expectOffset(FileHeader, "magic", 0);
+    try expectOffset(FileHeader, "version", 4);
+    try expectOffset(FileHeader, "index", 8);
+    try expectOffset(FileHeader, "capacity", 16);
+    try expectOffset(FileHeader, "first_seq", 24);
+    try expectOffset(FileHeader, "start_qpc", 32);
+    try expectOffset(FileHeader, "started", 40);
+    try std.testing.expectEqual(56, @sizeOf(FileHeader));
+
+    try expectOffset(Record, "frames", 0);
+    try expectOffset(Record, "flags", 4);
+    try expectOffset(Record, "len", 8);
+    try expectOffset(Record, "first_frame", 16);
+    try expectOffset(Record, "capture_qpc", 24);
+    try std.testing.expectEqual(0, @bitOffsetOf(RecordFlags, "silent"));
+    try std.testing.expectEqual(1, @bitOffsetOf(RecordFlags, "timestamp_error"));
+    try std.testing.expectEqual(2, @bitOffsetOf(RecordFlags, "discontinuity"));
+
+    try expectOffset(TrackStart, "sample", 0);
+    try expectOffset(TrackStart, "channels", 1);
+    try expectOffset(TrackStart, "block_align", 2);
+    try expectOffset(TrackStart, "rate", 4);
+    try expectOffset(TrackStart, "device_format_known", 8);
+    try expectOffset(TrackStart, "device_sample", 9);
+    try expectOffset(TrackStart, "device_bits", 10);
+    try expectOffset(TrackStart, "device_rate", 12);
+    try expectOffset(TrackStart, "device_channels", 16);
+    try expectOffset(TrackStart, "raw", 18);
+    try expectOffset(TrackStart, "device_name_len", 20);
+    try expectOffset(TrackStart, "file_name_len", 22);
+
+    const h: Header = .{ .len = 0, .track = 0, .seq = 0, .kind = .audio };
+    try std.testing.expectEqualStrings("BBCH", std.mem.asBytes(&h)[0..4]);
+    const f: FileHeader = .{ .index = 0, .capacity = 0, .first_seq = 0, .start_qpc = 0, .started = @splat(0) };
+    try std.testing.expectEqualStrings("BBJF", std.mem.asBytes(&f)[0..4]);
+    try std.testing.expect(@sizeOf(FileHeader) <= FileHeader.data_start);
+    try std.testing.expectEqual(0, FileHeader.data_start % chunk_align);
+}
+
+test "Header.size" {
+    const cases = [_]struct { u32, u64 }{
+        .{ 0, 64 },
+        .{ 1, 128 },
+        .{ 64, 128 },
+        .{ 65, 192 },
+        // The largest payload a header can describe: no overflow.
+        .{ std.math.maxInt(u32), (1 << 32) + 64 },
+    };
+    for (cases) |c| {
+        const h: Header = .{ .len = c[0], .track = 1, .seq = 0, .kind = .audio };
+        try std.testing.expectEqual(c[1], h.size());
+        try std.testing.expectEqual(0, h.size() % chunk_align);
+    }
+}
+
+/// The journal_seq of testChunk's chunk.
+const test_seq = 4242;
+
+/// An audio chunk of one Record and its samples, as the writer lays it out: header, payload,
+/// then alignment padding. Returns its bytes in `buf`.
+fn testChunk(buf: []align(8) u8) []u8 {
+    const samples = [_]i16{ 0, 1000, -1000, 32767, -32768, 7, -7, 12345 };
+    const record: Record = .{ .frames = 4, .flags = .{ .discontinuity = true }, .len = @sizeOf(@TypeOf(samples)), .first_frame = 480_000, .capture_qpc = 123_456_789 };
+    const payload: [2][]const u8 = .{ std.mem.asBytes(&record), std.mem.sliceAsBytes(&samples) };
+    var h: Header = .{
+        .len = @intCast(payload[0].len + payload[1].len),
+        .track = 3,
+        .seq = 17,
+        .kind = .audio,
+        .frames = record.frames,
+        .first_frame = record.first_frame,
+        .capture_qpc = record.capture_qpc,
+        .write_qpc = 123_999_999,
+        .journal_seq = test_seq,
+    };
+    h.crc = h.computeCrc(&payload);
+    const chunk = buf[0..@intCast(h.size())];
+    // Whatever was in the ring before: alignment padding isn't written, nor in the CRC.
+    @memset(chunk, 0xA5);
+    @memcpy(chunk[0..@sizeOf(Header)], std.mem.asBytes(&h));
+    @memcpy(chunk[@sizeOf(Header)..][0..payload[0].len], payload[0]);
+    @memcpy(chunk[@sizeOf(Header) + payload[0].len ..][0..payload[1].len], payload[1]);
+    return chunk;
+}
+
+/// Whether the chunk at the start of `area` (the rest of the data area) passes the checks
+/// readChunks in record.zig makes: its magic, the journal_seq expected next, that it fits in
+/// the area, and its CRC, which covers no payload for padding.
+fn testChunkOk(area: []const u8, next_seq: u64) bool {
+    const h = std.mem.bytesToValue(Header, area[0..@sizeOf(Header)]);
+    if (h.magic != magic or h.journal_seq != next_seq or h.size() > area.len) return false;
+    const payload_len: usize = if (h.kind == .padding) 0 else h.len;
+    return h.computeCrc(&.{area[@sizeOf(Header)..][0..payload_len]}) == h.crc;
+}
+
+test "a chunk round-trips, its CRC computed from any split of the payload" {
+    var buf: [256]u8 align(8) = @splat(0x5A);
+    const chunk = testChunk(&buf);
+    try std.testing.expectEqual(128, chunk.len);
+    try std.testing.expect(testChunkOk(&buf, test_seq));
+    // The previous lap's chunk at the same place: its journal_seq is older.
+    try std.testing.expect(!testChunkOk(&buf, test_seq + 1));
+
+    const h = std.mem.bytesToValue(Header, chunk[0..@sizeOf(Header)]);
+    try std.testing.expectEqual(magic, h.magic);
+    try std.testing.expectEqual(Kind.audio, h.kind);
+    try std.testing.expectEqual(test_seq, h.journal_seq);
+    const r = std.mem.bytesToValue(Record, chunk[@sizeOf(Header)..][0..@sizeOf(Record)]);
+    try std.testing.expectEqual(4, r.frames);
+    try std.testing.expect(r.flags.discontinuity and !r.flags.silent and !r.flags.timestamp_error);
+    try std.testing.expectEqual(480_000, r.first_frame);
+    try std.testing.expectEqual(@sizeOf(Record) + r.len, h.len);
+
+    // The writer passes the payload in pieces (records and samples straight from the ring);
+    // recovery reads it whole.
+    const payload = chunk[@sizeOf(Header)..][0..h.len];
+    for (0..payload.len + 1) |split| {
+        try std.testing.expectEqual(h.crc, h.computeCrc(&.{ payload[0..split], payload[split..] }));
+    }
+    try std.testing.expectEqual(h.crc, h.computeCrc(&.{ "", payload, "" }));
+}
+
+// What the checks are for: a scan must stop where the journal's new data ends, so it may never
+// take damaged or half-written data for a chunk.
+test "damaged and half-written chunks are caught" {
+    var buf: [256]u8 align(8) = @splat(0x5A);
+    const chunk = testChunk(&buf);
+    const h = std.mem.bytesToValue(Header, chunk[0..@sizeOf(Header)]);
+    const end = @sizeOf(Header) + h.len;
+
+    // Every bit of the header and the payload: the magic, the CRC itself, and what it covers.
+    for (0..end) |i| for (0..8) |bit| {
+        chunk[i] ^= @as(u8, 1) << @intCast(bit);
+        defer chunk[i] ^= @as(u8, 1) << @intCast(bit);
+        if (testChunkOk(&buf, test_seq)) {
+            std.debug.print("flipping bit {d} of byte {d} went unnoticed\n", .{ bit, i });
+            return error.TestUnexpectedResult;
+        }
+    };
+    // Not the alignment padding after the payload, which is never written.
+    @memset(chunk[end..], 0x00);
+    try std.testing.expect(testChunkOk(&buf, test_seq));
+
+    // Torn: the write stopped partway, leaving the previous lap's bytes, or a new file's
+    // zeros, after it. Wherever it stopped inside the payload.
+    var torn: [256]u8 align(8) = @splat(0x5A);
+    for (@sizeOf(Header)..end) |stop| {
+        for ([_]u8{ 0x00, 0xA5 }) |stale| {
+            @memcpy(torn[0..chunk.len], chunk);
+            @memset(torn[stop..end], stale);
+            // Unless the stale bytes happen to be what would've been written.
+            if (std.mem.eql(u8, torn[stop..end], chunk[stop..end])) continue;
+            if (testChunkOk(&torn, test_seq)) {
+                std.debug.print("a write torn at byte {d} over 0x{x} went unnoticed\n", .{ stop, stale });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+
+    // A header claiming less payload than was written, or more: reaching into the stale bytes
+    // after the chunk, or past the end of the area.
+    @memcpy(torn[0..chunk.len], chunk);
+    for ([_]u32{ h.len - 1, 0, h.len + 64, h.len + 128, 1 << 20 }) |len| {
+        var bad = h;
+        bad.len = len;
+        @memcpy(torn[0..@sizeOf(Header)], std.mem.asBytes(&bad));
+        if (testChunkOk(&torn, test_seq)) {
+            std.debug.print("a header claiming {d} bytes of payload, not {d}, went unnoticed\n", .{ len, h.len });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+// Padding fills the rest of the data area with bytes that aren't the journal's: its CRC is
+// the header's alone, so whatever the bytes are, it passes.
+test "a padding chunk's CRC is its header's" {
+    var area: [256]u8 align(8) = @splat(0x5A);
+    var h: Header = .{ .len = area.len - @sizeOf(Header), .track = 0, .seq = 0, .kind = .padding, .journal_seq = test_seq };
+    h.crc = h.computeCrc(&.{});
+    @memcpy(area[0..@sizeOf(Header)], std.mem.asBytes(&h));
+    try std.testing.expect(testChunkOk(&area, test_seq));
+    @memset(area[@sizeOf(Header)..], 0xA5);
+    try std.testing.expect(testChunkOk(&area, test_seq));
+    // Its header is still checked.
+    area[@offsetOf(Header, "len")] ^= 0x40;
+    try std.testing.expect(!testChunkOk(&area, test_seq));
+}
 
 const std = @import("std");

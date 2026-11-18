@@ -1788,8 +1788,11 @@ fn scale(v: i32, dpi: u32) i32 {
 }
 
 test {
+    _ = bb;
     _ = record;
     _ = @import("flac.zig");
+    _ = @import("journal.zig");
+    _ = @import("maxstring.zig");
 }
 
 const builtin = @import("builtin");
