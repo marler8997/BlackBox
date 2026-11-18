@@ -393,7 +393,8 @@ fn capture(c: *Capture, p: *Problem) error{Failed}!void {
             a.first = .{ .from = frame.time };
             break :blk true;
         };
-        if (keyframe) try encoder.forceKeyframe(p);
+        // A recorder's first, or one by time (see KeyframeClock).
+        if (sink.keyframes.due(frame.time) or keyframe) try encoder.forceKeyframe(p);
         if (try encoder.encode(frame, &sink, p)) {
             if (sink.waiting_since == null) sink.waiting_since = last_frame_qpc;
         } else {
@@ -511,6 +512,53 @@ const ReaderCallback = struct {
     }
 };
 
+/// A keyframe every 2 seconds: where a file can be cut, seeked to and recovered from.
+const keyframe_hns = 20_000_000;
+
+/// Keyframes by time, not frames: the encoder makes one every keyframe_hns of frames at the
+/// camera's announced rate, so a camera that slows (a BRIO announcing 60 fps gives ~33 in low
+/// light) would make them rarer, 3.6 s apart. This asks for one when none has come out for
+/// keyframe_hns of capture time, and not again until that long after asking (an encoder
+/// that looks ahead gives it some frames later).
+const KeyframeClock = struct {
+    /// When the last keyframe out, and the last asked for, were captured (100ns units).
+    last_out: ?i64 = null,
+    last_asked: ?i64 = null,
+
+    /// Whether to ask for a keyframe at a frame captured at `time`: if so, it's taken as asked.
+    fn due(k: *KeyframeClock, time: i64) bool {
+        const out = k.last_out orelse return false;
+        if (time - out < keyframe_hns) return false;
+        if (k.last_asked) |asked| if (time - asked < keyframe_hns) return false;
+        k.last_asked = time;
+        return true;
+    }
+
+    /// A keyframe came out, captured at `time`.
+    fn keyframeOut(k: *KeyframeClock, time: i64) void {
+        k.last_out = time;
+    }
+};
+
+test KeyframeClock {
+    var k: KeyframeClock = .{};
+    // Before any keyframe came out: the encoder makes the first.
+    try std.testing.expect(!k.due(0));
+    k.keyframeOut(0);
+    // A camera at half its rate: frames every 1/15 s where 1/30 was announced.
+    var keyframes: u32 = 0;
+    var t: i64 = 0;
+    while (t < 10 * 10_000_000) : (t += 666_666) {
+        if (k.due(t)) {
+            keyframes += 1;
+            // Out a few frames later, as from an encoder that looks ahead.
+            k.keyframeOut(t + 3 * 666_666);
+        }
+    }
+    // One every 2 seconds or so (each counted from the last out), not one a frame.
+    try std.testing.expect(keyframes >= 4 and keyframes <= 5);
+}
+
 /// Encoded frames to the recorder, if one is attached, each as the encoder gave it: its times
 /// and bytes, in the order it gave them.
 const RecorderSink = struct {
@@ -522,12 +570,14 @@ const RecorderSink = struct {
     /// When the encoder took the first frame it hasn't given anything back since, if it's
     /// holding any: see Capture.encoder_stall_ms.
     waiting_since: ?u64 = null,
+    keyframes: KeyframeClock = .{},
 
     pub fn encoded(s: *RecorderSink, e: Encoded, p: *Problem) error{Failed}!void {
         _ = p;
         const number = s.next;
         s.next += 1;
         s.waiting_since = null;
+        if (e.keyframe) s.keyframes.keyframeOut(e.time);
         _ = s.c.counts.encoded.fetchAdd(1, .monotonic);
         s.c.recorder_lock.lock();
         defer s.c.recorder_lock.unlock();
@@ -856,9 +906,11 @@ pub const VideoFormat = struct {
             f.fps_num != 0 and f.fps_den != 0;
     }
 
-    /// A keyframe every two seconds.
+    /// A keyframe every keyframe_hns of frames, at the camera's announced rate (the encoder
+    /// counts frames). A camera slower than it says (in low light) makes them rarer: see
+    /// KeyframeClock.
     fn keyframeInterval(f: VideoFormat) u32 {
-        return @intCast(@max(1, @min(std.math.maxInt(u32), @as(u64, f.fps_num) * 2 / f.fps_den)));
+        return @intCast(@max(1, @min(std.math.maxInt(u32), @as(u64, f.fps_num) * (keyframe_hns / 10_000_000) / f.fps_den)));
     }
 
     /// Bits per second: 0.1 bits per pixel, about 6 Mbps for 1080p at 30 fps, plenty for a
