@@ -44,7 +44,9 @@ jobs:
           }
           $committed = git show -s --format=%ct HEAD
           if ($LASTEXITCODE -ne 0) { throw "git show failed with exit code $LASTEXITCODE" }
-          $short = git rev-parse --short HEAD
+          # 7, not git's own choice (which grows with the repository): `zig build release`
+          # works out the same tag (tools/release.zig).
+          $short = git rev-parse --short=7 HEAD
           if ($LASTEXITCODE -ne 0) { throw "git rev-parse failed with exit code $LASTEXITCODE" }
           $tag = "{0:yyyy_MM_dd_HH_mm}-{1}" -f [DateTimeOffset]::FromUnixTimeSeconds([long]$committed).UtcDateTime, $short
           "tag=$tag" >> $env:GITHUB_OUTPUT

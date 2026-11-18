@@ -41,6 +41,18 @@ pub fn build(b: *std.Build) void {
         });
         if (cpu_arch == host_arch) host = arch;
     }
+    // Releasing master's head as a draft on GitHub (tools/release.zig): a tool for the build
+    // machine, which starts release.yml and waits for it. Any architecture can release.
+    const release_mod = b.createModule(.{
+        .root_source_file = b.path("tools/release.zig"),
+        .target = b.graph.host,
+    });
+    const release_run = b.addRunArtifact(b.addExecutable(.{ .name = "release", .root_module = release_mod }));
+    release_run.addDirectoryArg(b.path("."));
+    release_run.addPassthruArgs();
+    b.step("release", "Release master's head as a draft on GitHub (zig build release -- --dry-run to check only)").dependOn(&release_run.step);
+    const release_test = b.addRunArtifact(b.addTest(.{ .root_module = release_mod }));
+
     const install_step = b.getInstallStep();
     const run_step = b.step("run", "Build and run the GUI for this machine's architecture");
     const cli_step = b.step("cli", "Build and run the command line for this machine's architecture (zig build cli -- ARGS)");
@@ -55,6 +67,7 @@ pub fn build(b: *std.Build) void {
     cli_step.dependOn(arch.cli_run);
 
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = arch.gui.root_module })).step);
+    test_step.dependOn(&release_test.step);
     // Drift correction's scenarios: platform-independent, and heavy (minutes of audio through
     // the resampler), so optimized even in a debug build.
     const resample_tests = b.addTest(.{ .root_module = b.createModule(.{
