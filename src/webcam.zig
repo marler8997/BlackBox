@@ -628,6 +628,31 @@ fn adapterName(want: ?Gpu.Adapter, buf: *[3 * 128]u8) []const u8 {
 /// made: it gives black). The picture at the webcam's frame rate (see noVideoTiming), the first
 /// a keyframe: the muxer repeats the run to fill a gap, so it plays as ordinary video. Made
 /// once, when the webcam starts. Allocated.
+/// How long makeNoVideo waits for an async encoder to take a frame.
+const novideo_wait_ms = 2000;
+
+/// Sleeps shorter than Sleep's (a scheduler tick, 16 ms): a high-resolution waitable timer's.
+const WaitableMsTimer = struct {
+    timer: win32.HANDLE,
+
+    fn init() WaitableMsTimer {
+        return .{ .timer = win32.CreateWaitableTimerExW(null, null, win32.CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, @bitCast(win32.TIMER_ALL_ACCESS)) orelse
+            win32.panicWin32("CreateWaitableTimerEx", win32.GetLastError()) };
+    }
+    fn deinit(t: WaitableMsTimer) void {
+        win32.closeHandle(t.timer);
+    }
+    fn sleep(t: WaitableMsTimer, ms: u32) void {
+        // Relative: negative, in 100 ns units.
+        const due: win32.LARGE_INTEGER = .{ .QuadPart = -@as(i64, ms) * 10_000 };
+        if (0 == win32.SetWaitableTimer(t.timer, &due, 0, null, null, 0)) win32.panicWin32("SetWaitableTimer", win32.GetLastError());
+        switch (@backingInt(win32.WaitForSingleObject(t.timer, win32.INFINITE))) {
+            0 => {},
+            else => win32.panicWin32("WaitForSingleObject(timer)", win32.GetLastError()),
+        }
+    }
+};
+
 fn makeNoVideo(gpa: std.mem.Allocator, format: VideoFormat, p: *Problem) error{Failed}![]u8 {
     var gpu: ?Gpu = null;
     defer if (gpu) |*g| g.deinit();
@@ -636,6 +661,8 @@ fn makeNoVideo(gpa: std.mem.Allocator, format: VideoFormat, p: *Problem) error{F
     try e.start(format, p);
     const buffer = try nv12Buffer(format, p);
     defer _ = buffer.IUnknown.Release();
+    const timer: WaitableMsTimer = .init();
+    defer timer.deinit();
     {
         var data: ?*u8 = null;
         try check(p, buffer.Lock(&data, null, null), "Drawing the NO VIDEO picture");
@@ -671,14 +698,16 @@ fn makeNoVideo(gpa: std.mem.Allocator, format: VideoFormat, p: *Problem) error{F
         defer _ = sample.?.IUnknown.Release();
         try check(p, sample.?.AddBuffer(buffer), "Creating a frame");
         const time: i64 = @intCast(i * timing.interval);
-        // An async encoder takes a frame once it asks for one.
+        // An async encoder takes a frame once it asks for one. Tried every millisecond: on a
+        // high-resolution timer, as Sleep(1) is a scheduler tick (16 ms, longer than a frame
+        // takes). Not forever: an encoder that never asks fails the webcam, not hangs it.
         const deadline = record.qpc100ns() + novideo_wait_ms * 10_000;
         while (!try e.encode(.{ .sample = sample.?, .time = time }, &sink, p)) {
             if (record.qpc100ns() >= deadline) {
                 p.* = .{ .encoder_misbehaved = "it took no frame to make its NO VIDEO picture" };
                 return error.Failed;
             }
-            win32.Sleep(1);
+            timer.sleep(1);
         }
     }
     try e.drain(&sink, p);
@@ -729,8 +758,6 @@ fn noVideoTiming(format: VideoFormat) struct { interval: u32, frames: u32 } {
     const interval: u32 = @intCast(@max(1, @as(u64, 10_000_000) * format.fps_den / format.fps_num));
     return .{ .interval = interval, .frames = @intCast(@min(mp4.fragment_max_frames, @max(1, novideo_run_hns / interval))) };
 }
-/// How long makeNoVideo waits for an async encoder to take a frame.
-const novideo_wait_ms = 2000;
 
 /// An NV12 frame's buffer, of `f`'s size, in system memory, its contents undefined.
 fn nv12Buffer(f: VideoFormat, p: *Problem) error{Failed}!*win32.IMFMediaBuffer {
