@@ -17,3 +17,15 @@ jobs:
       # The tests need no audio devices: drift correction is computation, recovery works in
       # %TEMP%, and the command line tests run blackbox.exe.
       - run: zig build install test --summary all
+  # Black Box is for Windows, but builds anywhere Zig runs: everything, for both architectures,
+  # cross built. (Nothing runs: the tests are Windows programs.)
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+      fail-fast: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: marler8997/setup-anyzig@master
+      - run: zig build install-x86_64 install-aarch64 installer --summary all
