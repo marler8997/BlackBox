@@ -1,8 +1,7 @@
 //! Windows platform layer and entry point. App logic lives in bb.zig.
 
 // ---------------------------------------------------------------------------
-// Crash handling, adapted from github.com/marler8997/zig-win32-crash-handling.
-// Every panic and unhandled exception writes a report with a wintrace stack trace to a new
+// Crash handling: every panic and unhandled exception writes a report with a wintrace stack trace to a new
 // file in %LOCALAPPDATA%\BlackBox\crashes, then shows a message box saying where it is.
 // There's no other logging. wintrace traces are module+offset, symbolize them with
 // wintrace-symbolize and the matching PDB.
@@ -39,59 +38,74 @@ pub const wintrace_options: wintrace.Options = .{ .mode = .symbolize };
 
 const app_name = "BlackBox";
 
-const crash = struct {
-    /// How far the panic handler got. A panic while logging or showing the message box re-enters
-    /// the handler, which skips the step that panicked instead of recursing forever.
-    var panic_state: enum { none, log, msgbox } = .none;
-    /// This process's report file, see initCrashPath. Null until main sets it.
-    var path: ?[:0]const u16 = null;
-    /// Where this crash's report went, for the message box.
-    var report: ?union(enum) {
-        file,
-        no_path,
-        file_failed: win32.WIN32_ERROR,
-    } = null;
-};
-
 /// Creates the report file and points stderr (what wintrace and our panic handler write to)
 /// at it. Once per crash: an exception raised after a panic (std.process.abort's breakpoint)
 /// must not start another report.
 fn prepareCrashReport() void {
-    if (crash.report != null) return;
-    const path = crash.path orelse {
-        crash.report = .no_path;
+    if (global.crash_report != null) return;
+    const path = global.crash_path orelse {
+        global.crash_report = .no_path;
         return;
     };
     const handle = win32.CreateFileW(path, win32.FILE_GENERIC_WRITE, .{ .READ = 1 }, null, win32.CREATE_NEW, win32.FILE_ATTRIBUTE_NORMAL, null);
     if (handle == win32.INVALID_HANDLE_VALUE) {
-        crash.report = .{ .file_failed = win32.GetLastError() };
+        global.crash_report = .{ .file_failed = win32.GetLastError() };
         return;
     }
     std.os.windows.peb().ProcessParameters.hStdError = handle;
-    crash.report = .file;
+    global.crash_report = .file;
 }
 
 pub const panic = std.debug.FullPanic(onPanic);
 fn onPanic(msg: []const u8, ret_addr: ?usize) noreturn {
-    if (crash.panic_state == .none) {
-        crash.panic_state = .log;
+    if (global.panic_state == .none) {
+        global.panic_state = .log;
         prepareCrashReport();
         // Before the message box, which may never be dismissed.
         var buf: [256]u8 = undefined;
-        const stderr = std.debug.lockStderr(&buf);
-        const w = &stderr.file_writer.interface;
+        var report = reportWriter(&buf);
+        const w = &report;
         write: {
             w.print("panic: {s}\n", .{msg}) catch break :write;
             wintrace.writeCurrentStackTrace(w, ret_addr orelse @returnAddress()) catch break :write;
             w.flush() catch break :write;
         }
     }
-    if (crash.panic_state == .log) {
-        crash.panic_state = .msgbox;
+    if (global.panic_state == .log) {
+        global.panic_state = .msgbox;
         crashMsgbox("{s}", .{msg});
     }
     // Not std.debug.defaultPanic, which would print the message and trace again.
     std.process.abort();
+}
+
+/// The crash report (stderr, once prepareCrashReport points it at the file), written
+/// directly: std.debug.lockStderr takes a lock this thread may hold already, in a panic.
+fn reportWriter(buffer: []u8) std.Io.Writer {
+    return .{ .vtable = &.{ .drain = drainReport }, .buffer = buffer };
+}
+
+fn drainReport(w: *std.Io.Writer, data: []const []const u8, splat: usize) error{WriteFailed}!usize {
+    try writeReport(w.buffered());
+    w.end = 0;
+    var written: usize = 0;
+    for (data[0 .. data.len - 1]) |bytes| {
+        try writeReport(bytes);
+        written += bytes.len;
+    }
+    const last = data[data.len - 1];
+    for (0..splat) |_| try writeReport(last);
+    return written + splat * last.len;
+}
+
+fn writeReport(bytes: []const u8) error{WriteFailed}!void {
+    const handle = std.os.windows.peb().ProcessParameters.hStdError;
+    var rest = bytes;
+    while (rest.len > 0) {
+        var written: u32 = 0;
+        if (0 == win32.WriteFile(handle, rest.ptr, @intCast(@min(rest.len, std.math.maxInt(u32))), &written, null)) return error.WriteFailed;
+        rest = rest[written..];
+    }
 }
 
 fn unhandledExceptionFilter(info: *std.os.windows.EXCEPTION_POINTERS) callconv(.winapi) c_long {
@@ -107,43 +121,18 @@ fn unhandledExceptionFilter(info: *std.os.windows.EXCEPTION_POINTERS) callconv(.
     return action;
 }
 
-/// Sets crash.path to %LOCALAPPDATA%\BlackBox\crashes\<start time>_pid<pid>.txt, creating
-/// the folders. Named now, so a crash only has to create the file. The start time and pid make
-/// it unique to this process: crashes never overwrite each other, even across instances.
-fn initCrashPath() void {
-    var appdata: ?[*:0]u16 = null;
-    {
-        const hr = win32.SHGetKnownFolderPath(&win32.FOLDERID_LocalAppData, .DEFAULT, null, &appdata);
-        if (hr.failed) win32.panicHresult("SHGetKnownFolderPath(LocalAppData)", hr);
-    }
-    defer win32.CoTaskMemFree(appdata);
-    const appdata_dir = std.mem.span(appdata.?);
-
-    var t: win32.SYSTEMTIME = undefined;
-    win32.GetLocalTime(&t);
-    var name_buf: [64]u8 = undefined;
-    const name = std.fmt.bufPrint(&name_buf, "\\{d:0>4}-{d:0>2}-{d:0>2}_{d:0>2}-{d:0>2}-{d:0>2}_pid{d}.txt", .{
-        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, win32.GetCurrentProcessId(),
-    }) catch unreachable;
-
-    const app_dir = win32.L("\\" ++ app_name);
-    const crashes_dir = win32.L("\\crashes");
-    // Needed until the process ends, so it's never freed, and doesn't come from global.gpa
-    // whose leak check runs before that.
-    const path = std.heap.smp_allocator.allocSentinel(u16, appdata_dir.len + app_dir.len + crashes_dir.len + name.len, 0) catch
-        @panic("out of memory for the crash report path");
-    var len: usize = 0;
-    // Each folder is created while the path ends there; the next part overwrites the end.
-    for ([_][]const u16{ appdata_dir, app_dir, crashes_dir }, 0..) |part, i| {
-        @memcpy(path[len..][0..part.len], part);
-        len += part.len;
-        if (i > 0) {
-            path[len] = 0;
-            createDir(path[0..len :0]);
-        }
-    }
-    for (name, path[len..]) |c, *w| w.* = c;
-    crash.path = path;
+/// Refuses to run emulated: the x86_64 build on an ARM64 PC (Windows on ARM runs x64 programs
+/// emulated; an ARM64 build can't start on x64 at all). Emulation costs CPU, and a recorder
+/// short of CPU loses audio. IsWow64Process2 gives the machine's own architecture even to an
+/// emulated process.
+fn exitIfEmulated() void {
+    var process: win32.IMAGE_FILE_MACHINE = undefined;
+    var native: win32.IMAGE_FILE_MACHINE = undefined;
+    if (0 == win32.IsWow64Process2(win32.GetCurrentProcess(), &process, &native))
+        win32.panicWin32("IsWow64Process2", win32.GetLastError());
+    if (builtin.cpu.arch != .x86_64 or native != .ARM64) return;
+    _ = win32.MessageBoxW(null, win32.L("Uh oh, you've installed Black Box for the wrong architecture!\nYou're on ARM64 but you're currently running x86_64. Re-install Black Box for ARM64."), win32.L("Black Box - Wrong Architecture"), .{ .ICONHAND = 1 });
+    win32.ExitProcess(1);
 }
 
 /// Deinits the debug allocator, which reports leaks to stderr, so stderr goes to this run's
@@ -153,11 +142,11 @@ fn initCrashPath() void {
 fn checkLeaks(debug_allocator: *std.heap.DebugAllocator(.{}), comptime what: []const u8) void {
     prepareCrashReport();
     if (debug_allocator.deinit() == .ok) {
-        if (crash.report.? == .file) {
+        if (global.crash_report.? == .file) {
             win32.closeHandle(std.os.windows.peb().ProcessParameters.hStdError);
-            if (0 == win32.DeleteFileW(crash.path.?)) win32.panicWin32("DeleteFile(crash report)", win32.GetLastError());
+            if (0 == win32.DeleteFileW(global.crash_path.?)) win32.panicWin32("DeleteFile(crash report)", win32.GetLastError());
         }
-        crash.report = null;
+        global.crash_report = null;
         return;
     }
     @panic(what);
@@ -188,10 +177,10 @@ fn crashMsgbox(comptime fmt: []const u8, args: anytype) void {
 }
 
 fn formatReportNote(_: void, w: *std.Io.Writer) std.Io.Writer.Error!void {
-    switch (crash.report orelse .no_path) {
-        .file => try w.print("Details were saved to {f}", .{std.unicode.fmtUtf16Le(crash.path.?)}),
+    switch (global.crash_report orelse .no_path) {
+        .file => try w.print("Details were saved to {f}", .{std.unicode.fmtUtf16Le(global.crash_path.?)}),
         .no_path => try w.writeAll("Details couldn't be saved, this happened before the crash report file was named."),
-        .file_failed => |e| try w.print("Details couldn't be saved to {f}: {f}", .{ std.unicode.fmtUtf16Le(crash.path.?), e }),
+        .file_failed => |e| try w.print("Details couldn't be saved to {f}: {f}", .{ std.unicode.fmtUtf16Le(global.crash_path.?), e }),
     }
 }
 
@@ -200,15 +189,23 @@ fn formatReportNote(_: void, w: *std.Io.Writer) std.Io.Writer.Error!void {
 /// Set up before the window is created and alive until after it's destroyed, so window
 /// procedures can use them. What the window owns is in Window instead.
 const global = struct {
+    /// How far the panic handler got. A panic while logging or showing the message box re-enters
+    /// the handler, which skips the step that panicked instead of recursing forever.
+    var panic_state: enum { none, log, msgbox } = .none;
+    var crash_path: ?[:0]const u16 = null;
+    var crash_report: ?union(enum) {
+        file,
+        no_path,
+        file_failed: win32.WIN32_ERROR,
+    } = null;
     /// For allocations that come and go. See main.
     var gpa: std.mem.Allocator = undefined;
     var dwrite_factory: *win32.IDWriteFactory = undefined;
     /// Font family for bb.Icon glyphs, see findIconFont.
     var icon_family: [:0]const u16 = undefined;
-    /// Where recordings go, a folder each: %LOCALAPPDATA%\BlackBox\rec. Allocated, see
-    /// initPaths.
+    /// Where recordings go, a folder each: %LOCALAPPDATA%\BlackBox\rec. Allocated by main.
     var rec_dir: [:0]const u16 = undefined;
-    /// Its strings are allocated, see initPaths.
+    /// Its strings are allocated by main.
     var disk: bb.Disk = .{};
     /// The main window's state, from its WM_CREATE to its WM_DESTROY.
     var window: ?Window = null;
@@ -537,12 +534,51 @@ pub fn main() void {
     if (wintrace.SetUnhandledExceptionFilter(&unhandledExceptionFilter) != null)
         @panic("an unhandled exception filter was already installed");
 
-    initCrashPath();
+    // The crash report's path, %LOCALAPPDATA%\BlackBox\crashes\<start time>_pid<pid>.txt, its
+    // folders created now so a crash only has to create the file. The start time and pid make
+    // it unique to this process: crashes never overwrite each other, even across instances.
+    {
+        var appdata: ?[*:0]u16 = null;
+        {
+            const hr = win32.SHGetKnownFolderPath(&win32.FOLDERID_LocalAppData, .DEFAULT, null, &appdata);
+            if (hr.failed) win32.panicHresult("SHGetKnownFolderPath(LocalAppData)", hr);
+        }
+        defer win32.CoTaskMemFree(appdata);
+        const appdata_dir = std.mem.span(appdata.?);
+
+        var t: win32.SYSTEMTIME = undefined;
+        win32.GetLocalTime(&t);
+        var name_buf: [64]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "\\{d:0>4}-{d:0>2}-{d:0>2}_{d:0>2}-{d:0>2}-{d:0>2}_pid{d}.txt", .{
+            t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, win32.GetCurrentProcessId(),
+        }) catch unreachable;
+
+        const app_dir = win32.L("\\" ++ app_name);
+        const crashes_dir = win32.L("\\crashes");
+        // Needed until the process ends, so it's never freed, and doesn't come from global.gpa
+        // whose leak check runs before that.
+        const path = std.heap.smp_allocator.allocSentinel(u16, appdata_dir.len + app_dir.len + crashes_dir.len + name.len, 0) catch
+            @panic("out of memory for the crash report path");
+        var len: usize = 0;
+        // Each folder is created while the path ends there; the next part overwrites the end.
+        for ([_][]const u16{ appdata_dir, app_dir, crashes_dir }, 0..) |part, i| {
+            @memcpy(path[len..][0..part.len], part);
+            len += part.len;
+            if (i > 0) {
+                path[len] = 0;
+                createDir(path[0..len :0]);
+            }
+        }
+        for (name, path[len..]) |c, *w| w.* = c;
+        global.crash_path = path;
+    }
 
     // Leaves room to report a stack overflow. Only for this thread, other threads that should
     // report an overflow need their own call.
     var guarantee: u32 = wintrace.stack_guarantee;
     if (0 == wintrace.SetThreadStackGuarantee(&guarantee)) win32.panicWin32("SetThreadStackGuarantee", win32.GetLastError());
+
+    exitIfEmulated();
 
     // Debug builds check that everything was freed when main ends, and catch bad frees.
     // Shorter-lived operations can get their own to be checked when they end.
@@ -558,8 +594,37 @@ pub fn main() void {
     }
     defer win32.CoUninitialize();
 
-    initPaths();
-    defer freePaths();
+    // The recordings folder, and the disk facts' strings.
+    {
+        const gpa = global.gpa;
+        const app_dir = knownFolderPath(gpa, &win32.FOLDERID_LocalAppData, &.{win32.L("\\" ++ app_name)});
+        defer gpa.free(app_dir);
+        createDir(app_dir);
+        global.rec_dir = std.mem.concatWithSentinel(gpa, u16, &.{ app_dir, win32.L("\\rec") }, 0) catch @panic("out of memory");
+        createDir(global.rec_dir);
+        global.disk.out_dir = std.unicode.wtf16LeToWtf8Alloc(gpa, global.rec_dir) catch @panic("out of memory");
+
+        var root_buf: [max_path]u16 = undefined;
+        if (0 == win32.GetVolumePathNameW(global.rec_dir, @ptrCast(&root_buf), root_buf.len))
+            win32.panicWin32("GetVolumePathName", win32.GetLastError());
+        const root = std.mem.sliceTo(&root_buf, 0);
+
+        var windir_buf: [max_path]u16 = undefined;
+        const windir_len = win32.GetWindowsDirectoryW(@ptrCast(&windir_buf), windir_buf.len);
+        if (windir_len == 0 or windir_len >= windir_buf.len) win32.panicWin32("GetWindowsDirectory", win32.GetLastError());
+        windir_buf[windir_len] = 0;
+        var sys_root_buf: [max_path]u16 = undefined;
+        if (0 == win32.GetVolumePathNameW(windir_buf[0..windir_len :0], @ptrCast(&sys_root_buf), sys_root_buf.len))
+            win32.panicWin32("GetVolumePathName(windir)", win32.GetLastError());
+        global.disk.is_system = std.ascii.eqlIgnoreCase(
+            std.mem.sliceAsBytes(std.mem.sliceTo(&sys_root_buf, 0)),
+            std.mem.sliceAsBytes(root),
+        );
+    }
+    defer {
+        global.gpa.free(global.disk.out_dir);
+        global.gpa.free(global.rec_dir);
+    }
     refreshDisk();
     bb.init(global.gpa);
     defer bb.deinit();
@@ -1442,41 +1507,6 @@ fn applyCaptureExclusion(hwnd: win32.HWND) void {
 // ---------------------------------------------------------------------------
 // Storage facts
 // ---------------------------------------------------------------------------
-
-/// The recordings folder and the disk facts' strings, allocated with global.gpa: free them
-/// with freePaths.
-fn initPaths() void {
-    const gpa = global.gpa;
-    const app_dir = knownFolderPath(gpa, &win32.FOLDERID_LocalAppData, &.{win32.L("\\" ++ app_name)});
-    defer gpa.free(app_dir);
-    createDir(app_dir);
-    global.rec_dir = std.mem.concatWithSentinel(gpa, u16, &.{ app_dir, win32.L("\\rec") }, 0) catch @panic("out of memory");
-    createDir(global.rec_dir);
-    global.disk.out_dir = std.unicode.wtf16LeToWtf8Alloc(gpa, global.rec_dir) catch @panic("out of memory");
-
-    var root_buf: [max_path]u16 = undefined;
-    if (0 == win32.GetVolumePathNameW(global.rec_dir, @ptrCast(&root_buf), root_buf.len))
-        win32.panicWin32("GetVolumePathName", win32.GetLastError());
-    const root = std.mem.sliceTo(&root_buf, 0);
-
-    var windir_buf: [max_path]u16 = undefined;
-    const windir_len = win32.GetWindowsDirectoryW(@ptrCast(&windir_buf), windir_buf.len);
-    if (windir_len == 0 or windir_len >= windir_buf.len) win32.panicWin32("GetWindowsDirectory", win32.GetLastError());
-    windir_buf[windir_len] = 0;
-    var sys_root_buf: [max_path]u16 = undefined;
-    if (0 == win32.GetVolumePathNameW(windir_buf[0..windir_len :0], @ptrCast(&sys_root_buf), sys_root_buf.len))
-        win32.panicWin32("GetVolumePathName(windir)", win32.GetLastError());
-    global.disk.is_system = std.ascii.eqlIgnoreCase(
-        std.mem.sliceAsBytes(std.mem.sliceTo(&sys_root_buf, 0)),
-        std.mem.sliceAsBytes(root),
-    );
-}
-
-fn freePaths() void {
-    const gpa = global.gpa;
-    gpa.free(global.disk.out_dir);
-    gpa.free(global.rec_dir);
-}
 
 /// A known folder's path with `suffixes` appended, allocated.
 fn knownFolderPath(gpa: std.mem.Allocator, id: *const win32.Guid, suffixes: []const []const u16) [:0]u16 {
