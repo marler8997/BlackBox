@@ -31,18 +31,31 @@ pub fn build(b: *std.Build) void {
     // build machine's architecture.
     const host_arch = b.graph.host.result.cpu.arch;
     var host: ?Arch = null;
-    for ([_]std.Target.Cpu.Arch{ .x86_64, .aarch64 }) |cpu_arch| {
-        const arch = addArch(b, cpu_arch, .{
+    var archs: [std.enums.values(payload.Arch).len]Arch = undefined;
+    inline for (comptime std.enums.values(payload.Arch), &archs) |a, *arch| {
+        const cpu_arch = a.cpu();
+        arch.* = addArch(b, cpu_arch, .{
             .optimize = optimize,
             .win32 = win32_mod,
             .wintrace = wintrace_mod,
             .std = patched_std,
             .ico = ico,
         });
-        if (cpu_arch == host_arch) host = arch;
+        if (cpu_arch == host_arch) host = arch.*;
     }
-    // Releasing master's head as a draft on GitHub (tools/release.zig): a tool for the build
-    // machine, which starts release.yml and waits for it. Any architecture can release.
+    const installer_step = b.step("installer", "Build both installers, zig-out/BlackBoxInstaller.exe (x86_64, installs either build) and BlackBoxInstaller-arm64.exe");
+    inline for (comptime std.enums.values(payload.Arch)) |a| {
+        const installer = addInstaller(b, a, &archs, .{
+            .optimize = optimize,
+            .win32 = win32_mod,
+            .wintrace = wintrace_mod,
+            .std = patched_std,
+            .ico = ico,
+        });
+        installer_step.dependOn(installer.install);
+        if (a.cpu() == host_arch)
+            b.step("run-installer", "Build this machine's installer and run it (-- --uninstall to uninstall)").dependOn(installer.run);
+    }
     const release_mod = b.createModule(.{
         .root_source_file = b.path("tools/release.zig"),
         .target = b.graph.host,
@@ -186,5 +199,53 @@ fn addArch(b: *std.Build, cpu_arch: std.Target.Cpu.Arch, shared: Shared) Arch {
     return .{ .target = target, .gui = gui, .cli = cli, .install = install, .run = &run.step, .cli_run = &cli_run.step };
 }
 
+fn addInstaller(b: *std.Build, comptime installer_arch: payload.Arch, archs: []const Arch, shared: Shared) struct { install: *std.Build.Step, run: *std.Build.Step } {
+    const compress = b.addExecutable(.{
+        .name = "compress",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/compress.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    const mod = b.createModule(.{
+        .root_source_file = b.path("installer/installer.zig"),
+        .target = b.resolveTargetQuery(.{ .cpu_arch = installer_arch.cpu(), .os_tag = .windows }),
+        .optimize = shared.optimize,
+        .imports = &.{
+            .{ .name = "std", .module = shared.std },
+            .{ .name = "win32", .module = shared.win32 },
+            .{ .name = "wintrace", .module = shared.wintrace },
+        },
+    });
+    mod.addWin32ResourceFile(.{
+        .file = b.path("src/win32.rc"),
+        .include_paths = &.{shared.ico.dirname()},
+    });
+    inline for (comptime installer_arch.installerArches()) |payload_arch| {
+        const arch = archs[@intFromEnum(payload_arch)];
+        inline for (payload.files, 0..) |file, f| {
+            const exe = if (comptime std.mem.startsWith(u8, file, "bin\\")) arch.cli else arch.gui;
+            const source = if (comptime std.mem.endsWith(u8, file, ".pdb")) exe.getEmittedPdb() else exe.getEmittedBin();
+            const run = b.addRunArtifact(compress);
+            run.addFileArg(source);
+            const import_name = comptime payload.importName(payload_arch, f);
+            mod.addAnonymousImport(import_name, .{ .root_source_file = run.addOutputFileArg(import_name ++ ".zlib") });
+        }
+    }
+    const installer = b.addExecutable(.{
+        .name = installer_arch.installerName(),
+        .root_module = mod,
+        .win32_manifest = b.path("installer/installer.manifest"),
+    });
+    installer.subsystem = .windows;
+    const install = b.addInstallArtifact(installer, .{ .dest_dir = .{ .override = .prefix } });
+    b.step("installer-" ++ @tagName(installer_arch), "Build zig-out/" ++ comptime installer_arch.installerName() ++ ".exe").dependOn(&install.step);
+    const run = b.addRunArtifact(installer);
+    run.addPassthruArgs();
+    return .{ .install = &install.step, .run = &run.step };
+}
+
 const std = @import("std");
 const appicon = @import("appicon");
+const payload = @import("installer/payload.zig");

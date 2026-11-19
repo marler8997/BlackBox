@@ -63,27 +63,17 @@ jobs:
             }
           }
           $global:LASTEXITCODE = 0
-      # A zip per architecture, each the installed layout: BlackBox.exe and bin\blackbox.exe.
-      # Named for the OS (for when there's more than Windows) and architecture but not the
-      # version, the same every release, so the website can link to the latest's:
-      # releases/latest/download/BlackBox-windows-x86_64.zip. The version is the release's.
-      # With their .pdb files, so a crash's error trace names functions and lines. (build.zig
-      # cross builds each for its architecture's baseline CPU, never the runner's.)
+      # Named without the version, so the website can link to releases/latest/download/.
       - if: steps.tag.outputs.released != 'true'
         name: build
-        env:
-          TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          zig build install-x86_64 install-aarch64 -Doptimize=ReleaseSafe --prefix release --summary all
+          zig build installer -Doptimize=ReleaseSafe --prefix release --summary all
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          foreach ($arch in 'x86_64', 'aarch64') {
-            Compress-Archive -Path "release/$arch/appdata/*" -DestinationPath "BlackBox-windows-$arch.zip"
-          }
       - if: steps.tag.outputs.released != 'true'
         uses: actions/upload-artifact@v7
         with:
           name: BlackBox-${{ steps.tag.outputs.tag }}
-          path: BlackBox-*.zip
+          path: release/BlackBoxInstaller*.exe
           if-no-files-found: error
 
   publish:
@@ -113,7 +103,7 @@ jobs:
           } elseif ("$view" -notmatch 'release not found') {
             throw "gh release view $env:TAG failed with exit code ${LASTEXITCODE}: $view"
           }
-          $url = gh release create $env:TAG BlackBox-windows-x86_64.zip BlackBox-windows-aarch64.zip --draft --target $env:GITHUB_SHA --title $env:TAG --notes "Built from $env:GITHUB_SHA."
+          $url = gh release create $env:TAG BlackBoxInstaller.exe BlackBoxInstaller-arm64.exe --draft --target $env:GITHUB_SHA --title $env:TAG --notes "Built from $env:GITHUB_SHA."
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           @"
           ## Draft release $env:TAG
