@@ -474,26 +474,45 @@ const VBlank = struct {
         // Not current once monitors or adapters change.
         const current = if (v.factory) |f| f.IsCurrent() != 0 else false;
         if (!current or monitor != v.monitor) v.findOutput(monitor);
-        const hr = v.output.?.WaitForVBlank();
-        if (hr.failed) win32.panicHresult("IDXGIOutput.WaitForVBlank", hr);
+        if (v.output) |output| {
+            const hr = output.WaitForVBlank();
+            if (hr.failed) win32.panicHresult("IDXGIOutput.WaitForVBlank", hr);
+        } else {
+            // While the display configuration changes, MonitorFromWindow can return a monitor
+            // DXGI doesn't show yet, even from a new factory. Pace this frame by the compositor
+            // and look again next frame.
+            const hr = win32.DwmFlush();
+            if (hr.failed) win32.panicHresult("DwmFlush", hr);
+        }
     }
 
-    /// Any adapter's: a monitor can be on one we don't render with.
+    /// Any adapter's: a monitor can be on one we don't render with. Leaves `output` null if no
+    /// output shows `monitor`, even after a new factory.
     fn findOutput(v: *VBlank, monitor: win32.HMONITOR) void {
         if (v.output) |o| _ = o.IUnknown.Release();
         v.output = null;
         v.monitor = null;
-        if (v.factory) |f| if (f.IsCurrent() == 0) {
+        // A factory can still be current while its outputs predate a display change.
+        if (v.factory) |f| {
+            if (f.IsCurrent() != 0) if (searchOutputs(f, monitor)) |output| {
+                v.output = output;
+                v.monitor = monitor;
+                return;
+            };
             _ = f.IUnknown.Release();
             v.factory = null;
-        };
-        const factory = v.factory orelse blk: {
-            var f: *win32.IDXGIFactory1 = undefined;
-            const hr = win32.CreateDXGIFactory1(win32.IID_IDXGIFactory1, @ptrCast(&f));
+        }
+        var factory: *win32.IDXGIFactory1 = undefined;
+        {
+            const hr = win32.CreateDXGIFactory1(win32.IID_IDXGIFactory1, @ptrCast(&factory));
             if (hr.failed) win32.panicHresult("CreateDXGIFactory1", hr);
-            v.factory = f;
-            break :blk f;
-        };
+        }
+        v.factory = factory;
+        v.output = searchOutputs(factory, monitor) orelse return;
+        v.monitor = monitor;
+    }
+
+    fn searchOutputs(factory: *win32.IDXGIFactory1, monitor: win32.HMONITOR) ?*win32.IDXGIOutput {
         var adapter_index: u32 = 0;
         while (true) : (adapter_index += 1) {
             var adapter: *win32.IDXGIAdapter1 = undefined;
@@ -516,15 +535,11 @@ const VBlank = struct {
                     const hr = output.GetDesc(&desc);
                     if (hr.failed) win32.panicHresult("IDXGIOutput.GetDesc", hr);
                 }
-                if (desc.Monitor == monitor) {
-                    v.output = output;
-                    v.monitor = monitor;
-                    return;
-                }
+                if (desc.Monitor == monitor) return output;
                 _ = output.IUnknown.Release();
             }
         }
-        std.debug.panic("no DXGI output shows the window's monitor ({*})", .{monitor});
+        return null;
     }
 };
 
